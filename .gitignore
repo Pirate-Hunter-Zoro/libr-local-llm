@@ -1,0 +1,29 @@
+# ---- Slurm logs ----
+# Job logs record hostnames, paths, and prompts; keep them out of git.
+slurm_jobs/logs/*
+!slurm_jobs/logs/.gitkeep
+
+# ---- Never commit ----
+# No PHI should ever reach this repo -- it holds infrastructure only, no data
+# and no transcripts. These patterns are belt-and-braces.
+*.m4a
+*.wav
+*.mp3
+*.json
+!config/opencode.json
+*.jsonl
+*.csv
+*.gguf
+*.safetensors
+
+# ---- Editor / OS / secrets ----
+.claude/
+.vscode/
+.env
+.DS_Store
+Thumbs.db
+*~
+.*.swp
+__pycache__/
+*.pyc
+node_modules/
