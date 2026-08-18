@@ -2,6 +2,11 @@
 
 Local LLM inference on LIBR compute — **no admin rights, no data leaving the cluster.**
 
+> **This repo is public** (`github.com/Pirate-Hunter-Zoro/libr-local-llm`). That is defensible
+> because it holds serving configuration only — no PHI, no data, no credentials — but it is a
+> standing constraint on every future commit, not a one-time decision. Nothing sensitive goes in
+> here. Ever.
+
 This repo holds the serving infrastructure (Slurm jobs, client config) that the research repos sit
 on top of. It is deliberately *not* part of `PSYCH-ASR` or `TRD-EHR`: both projects need local
 inference, and a general-purpose model server is not a stage in either pipeline. If a third project
@@ -170,6 +175,9 @@ every user on the cluster.
 
 ### Verifying a 4-GPU shard
 
+**Not yet performed** — the accel job has never been submitted (§8). What follows is the acceptance
+criterion to check the first time it runs, not a record of observed behavior.
+
 After one prompt to `gpt-oss:120b`, on compute306:
 
 - `nvidia-smi` should show roughly **16–18 GB on each of four cards**. One card near 46 GB with three
@@ -212,9 +220,21 @@ Structure:
 - `provider.ollama.models` — keys must exactly match the ids returned by `GET /v1/models`, which for
   ollama are the tag names.
 - `model` — the default, `ollama/qwen3-coder:30b`.
+- `permission` — **top-level default-deny for `webfetch` and `websearch`.** Same principle as
+  `enabled_providers`: the default is "no", and exceptions are named explicitly. This matters because
+  opencode's built-in default for almost every gated tool is `allow` — an *absent* `permission`
+  section is not a closed door, it is an open one.
+- `agent.coder` — a `primary` agent that overrides both web tools back up to `ask` (not `allow`).
+  `default_agent` points at it. Every other agent — the built-in `build`, `plan`, `general`,
+  `explore`, `title`, `summary`, `compaction` — inherits the global deny.
+
+Resolution order is built-in agent defaults, then the top-level `permission` block, then the
+per-agent block; last one wins. Verified against the built-in `explore` agent, which ships with
+`webfetch: allow` and is correctly overridden to `deny` by the global block.
 
 Verify with `opencode models` on the server's node: it should list exactly three `ollama/` entries
-and nothing else.
+and nothing else. Verify the permission wiring with `opencode agent list`, which prints each agent's
+fully resolved rule stack — `coder` should end in `ask`, everything else in `deny`.
 
 **opencode cannot be used to reach Claude.** Its docs state Anthropic prohibits routing Claude
 Pro/Max subscriptions through it, and the plugins that did so were removed in 1.3.0. The only
@@ -248,7 +268,13 @@ Do not re-learn these.
    *size*, not its existence.
 10. **A Slurm job without `--gres=gpu:N` still sees the node's GPUs.** Seeing a card is not reserving
     one.
-11. **conda envs are not Python venvs.** `setup_envs.sh` in PSYCH-ASR creates *conda* prefix envs; a
+11. **opencode's permission defaults are `allow`, not `deny`.** Every gated tool except `doom_loop`
+    and `external_directory` defaults to `allow`. "We never configured web tools" therefore means
+    the web tools were *on*, not off. Only `.env` files are denied out of the box.
+12. **The built-in `explore` subagent ships with `webfetch`/`websearch` set to `allow`.** A global
+    deny does override it, but agent-level defaults exist and are invisible until you read the
+    resolved stack from `opencode agent list`. Do not assume the built-ins are inert.
+13. **conda envs are not Python venvs.** `setup_envs.sh` in PSYCH-ASR creates *conda* prefix envs; a
     conda env can hold compiled binaries (which is why it was a candidate for `zstd`), a `python -m
     venv` cannot.
 
@@ -256,18 +282,26 @@ Do not re-learn these.
 
 ## 8. Not done yet
 
-- **Web tooling for the coder.** opencode's schema exposes a `permission` section with explicit
-  `webfetch` and `websearch` entries (preferred over the deprecated `tools` field). Not yet
-  configured.
-- **The PHI boundary.** The coding assistant may have web tools; **anything reading transcripts must
-  not.** Nothing stops a tool-enabled agent from putting a transcript fragment into a search query,
-  which is an exfiltration event under PSYCH-ASR's on-prem constraint. Plan: separate opencode agent
-  profiles, or drive the clinical model from a plain Python client with no tools at all.
-- **vllm for Stage 4.** Ollama is right for interactive single-user coding. Batch transcript work
+- **The PHI boundary, layer 3.** Layers 1 and 2 are done (§6): global default-deny on `webfetch` /
+  `websearch`, and a single `coder` agent that raises them to `ask`. Both are config, and config is
+  one bad edit from being wrong. The remaining layer is the one that cannot be misconfigured:
+  **the clinical model must never run through opencode at all** — a plain Python client against the
+  loopback endpoint with no tool-calling surface in the code. Nothing stops a tool-enabled agent from
+  putting a transcript fragment into a search query, which is an exfiltration event under
+  PSYCH-ASR's on-prem constraint. Not yet written.
+- **vllm for PSYCH-ASR Stage 3c.** (Stage *3c* — behavioral and content coding with a local LLM.
+  PSYCH-ASR's Stage 4 is feasibility modeling at N=20 and involves no LLM at all; earlier versions of
+  this README, the Research-Journey README, and `LOCAL-LLM_TODO.txt` all mis-numbered this as
+  "Stage 4".) Ollama is right for interactive single-user coding. Batch transcript work
   wants vllm: continuous batching for throughput, and guided decoding against a JSON schema so the
   model is structurally incapable of emitting anything but a valid rating object. The HF safetensors
   copy of `google_medgemma-27b-text-it` is already staged and vllm consumes it directly — at bf16
   (~55 GB) it needs two A40s with tensor parallelism. Intended workflow: prototype prompts against
   ollama q8, run production passes on vllm bf16.
+- **The 4-GPU shard is unverified.** `gpt-oss:120b` finished downloading, but
+  `ollama_serve_accel.sbatch` has never been submitted and no prompt has ever reached the model. The
+  acceptance criteria in §4 are therefore a *specification*, not an observation. This is also the
+  cheapest available rehearsal for the vllm work above, which needs tensor parallelism across two
+  A40s on the same node.
 - **Walltime.** Both jobs are 8 h. `c3` and `c3_accel` allow up to 7 days if a longer-lived server
   is wanted.
