@@ -1,0 +1,132 @@
+#!/bin/bash
+# Bring up an Ollama server on a compute node and wait until it is actually
+# serving. Run this from anywhere, including the login node.
+#
+#   ollama-up            # single A40 on c3    (qwen3-coder, medgemma)
+#   ollama-up accel      # 4x A40 on c3_accel  (gpt-oss:120b)
+#   ollama-up accel 3    # ...with a 3-hour walltime instead of the default 8
+#
+# Exits 0 only when the server is listening. Prints the job id and node.
+set -euo pipefail
+
+PROFILE="${1:-single}"
+WALLTIME_HOURS="${2:-}"
+
+# The sbatch log paths are relative, so the job must run with the repo root as
+# its working directory. Derive it from this script's own location rather than
+# trusting wherever the caller happens to be standing.
+REPO_ROOT="$(cd "$(dirname "$(dirname "${BASH_SOURCE[0]}")")" && pwd)"
+
+case "$PROFILE" in
+    single)
+        SBATCH_FILE="slurm_jobs/ollama_serve.sbatch"
+        JOB_NAME="ollama_serve"
+        # c3_short caps at 9 h. Slurm would reject a longer request outright, but
+        # the error names a partition limit rather than the thing to change.
+        if [ -n "$WALLTIME_HOURS" ] && [ "$WALLTIME_HOURS" -gt 9 ] 2>/dev/null; then
+            echo "The single profile runs on c3_short, which caps at 9 hours." >&2
+            echo "For longer, switch that sbatch to the c3 partition (7 d cap)." >&2
+            exit 2
+        fi
+        ;;
+    accel)
+        SBATCH_FILE="slurm_jobs/ollama_serve_accel.sbatch"
+        JOB_NAME="ollama_serve_accel"
+        ;;
+    *)
+        echo "usage: ollama-up [single|accel] [walltime_hours]" >&2
+        exit 2
+        ;;
+esac
+
+ERR_LOG="${REPO_ROOT}/slurm_jobs/logs/${JOB_NAME}_err.txt"
+
+# OLLAMA_MAX_LOADED_MODELS is 1 and both profiles bind the same loopback port,
+# so a second server is never useful -- reuse whatever is already up.
+EXISTING="$(squeue -u "$USER" -n "$JOB_NAME" -t RUNNING,PENDING -h -o '%i' | head -1)"
+if [ -n "$EXISTING" ]; then
+    echo "A ${JOB_NAME} job is already submitted: ${EXISTING}" >&2
+    echo "Use 'ollama-down' first if you want a fresh one." >&2
+    exit 1
+fi
+
+# Truncate the previous run's stderr. The readiness check below greps this file
+# for "Listening on", and a stale hit from the last job would report success
+# before the new server has started.
+mkdir -p "${REPO_ROOT}/slurm_jobs/logs"
+: > "$ERR_LOG"
+
+SBATCH_ARGS=(--chdir="$REPO_ROOT" --parsable)
+if [ -n "$WALLTIME_HOURS" ]; then
+    # A command-line --time overrides the #SBATCH directive inside the file.
+    SBATCH_ARGS+=(--time="${WALLTIME_HOURS}:00:00")
+fi
+
+# --parsable prints the bare numeric job id instead of "Submitted batch job N".
+#
+# The SLURM_* scrub matters when this is run from inside another allocation --
+# a VSCode remote session on a compute node, say. sbatch inherits the outer
+# job's SLURM_* variables and they OVERRIDE the #SBATCH directives in the file,
+# so the server would silently come up with the wrong partition, memory, or GPU
+# count. Submit from a clean environment.
+JOB_ID="$(
+    for v in $(env | grep -oE '^SLURM_[A-Z_0-9]+' || true); do unset "$v"; done
+    sbatch "${SBATCH_ARGS[@]}" "$SBATCH_FILE"
+)"
+echo "Submitted ${JOB_NAME} as job ${JOB_ID} (profile: ${PROFILE})"
+
+echo "Waiting for allocation (Ctrl-C is safe -- the job stays queued)"
+ALLOCATED=0
+LAST_REASON=""
+for _ in $(seq 1 120); do
+    STATE="$(squeue -j "$JOB_ID" -h -o '%T' 2>/dev/null || true)"
+    [ "$STATE" = "RUNNING" ] && { ALLOCATED=1; break; }
+    if [ -z "$STATE" ]; then
+        echo "Job ${JOB_ID} left the queue without running. Check ${ERR_LOG}" >&2
+        exit 1
+    fi
+    # Surface WHY it is waiting. "Resources" on c3 usually means CPUs, not GPUs:
+    # the nodes each hold one A40, and a node can have its GPU free while having
+    # too few free CPUs for this job's --cpus-per-task.
+    REASON="$(squeue -j "$JOB_ID" -h -o '%r' 2>/dev/null || true)"
+    if [ "$REASON" != "$LAST_REASON" ]; then
+        echo "  pending: ${REASON}"
+        LAST_REASON="$REASON"
+    fi
+    sleep 5
+done
+
+if [ "$ALLOCATED" -ne 1 ]; then
+    echo "Job ${JOB_ID} is still ${STATE} after 10 minutes (reason: ${LAST_REASON})." >&2
+    echo "It remains queued and will start when the partition frees up." >&2
+    echo "Watch it with squeue, or drop it with 'ollama-down'." >&2
+    exit 1
+fi
+
+NODE="$(squeue -j "$JOB_ID" -h -o '%N')"
+ALLOC="$(scontrol show job "$JOB_ID" | grep -oP 'AllocTRES=\K\S+')"
+case "$ALLOC" in
+    *gres/gpu=*) ;;
+    # A job with no reserved GPU can still SEE the node's cards and will happily
+    # use one Slurm has promised to somebody else. Refuse to serve from that.
+    *) echo "Job ${JOB_ID} has no GPU reservation: ${ALLOC}" >&2; exit 1 ;;
+esac
+
+# Ollama logs to stderr, not stdout.
+echo -n "Waiting for ollama to listen"
+for _ in $(seq 1 120); do
+    if grep -q "Listening on" "$ERR_LOG" 2>/dev/null; then
+        echo
+        echo "Server up:  job ${JOB_ID}  node ${NODE}  ${ALLOC}"
+        echo "Endpoint:   127.0.0.1:11500 (loopback on ${NODE} only)"
+        echo "Connect:    ollama-code"
+        exit 0
+    fi
+    echo -n "."
+    sleep 2
+done
+
+echo
+echo "Job ${JOB_ID} is running on ${NODE} but never logged 'Listening on'." >&2
+echo "Check ${ERR_LOG}" >&2
+exit 1

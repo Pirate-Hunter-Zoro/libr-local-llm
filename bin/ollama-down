@@ -1,0 +1,30 @@
+#!/bin/bash
+# Cancel running Ollama server jobs. compute306 is the cluster's only 4-GPU
+# node -- do not leave the accel job holding it after you are done.
+#
+#   ollama-down          # cancel every ollama server job you own
+#   ollama-down accel    # cancel only the 4-GPU one
+#   ollama-down single   # cancel only the 1-GPU one
+set -euo pipefail
+
+case "${1:-all}" in
+    all)    NAMES="ollama_serve ollama_serve_accel" ;;
+    single) NAMES="ollama_serve" ;;
+    accel)  NAMES="ollama_serve_accel" ;;
+    *) echo "usage: ollama-down [all|single|accel]" >&2; exit 2 ;;
+esac
+
+FOUND=0
+for NAME in $NAMES; do
+    # -n matches the job name exactly, so ollama_serve does not also match
+    # ollama_serve_accel.
+    for JOB_ID in $(squeue -u "$USER" -n "$NAME" -t RUNNING,PENDING -h -o '%i'); do
+        NODE="$(squeue -j "$JOB_ID" -h -o '%N')"
+        scancel "$JOB_ID"
+        echo "Cancelled ${NAME} job ${JOB_ID} (${NODE:-unallocated})"
+        FOUND=1
+    done
+done
+
+[ "$FOUND" -eq 0 ] && echo "No Ollama server jobs to cancel."
+exit 0

@@ -1,0 +1,126 @@
+#!/bin/bash
+# Launch opencode (or fire a one-shot prompt) against the running Ollama server,
+# from anywhere -- including the login node.
+#
+# The endpoint is loopback-only on the serving node, so the client has to run
+# there too. This uses `srun --overlap` to step into the existing allocation
+# rather than ssh: no key needed, and it lands inside the job with the right
+# CUDA_VISIBLE_DEVICES already set.
+#
+#   ollama-code                          # TUI in the current directory
+#   ollama-code -d ~/proj                # TUI in another directory
+#   ollama-code "explain this repo"      # one-shot prompt, no TUI
+#   ollama-code -m gpt-oss:120b "hi"     # pick the model explicitly
+#   ollama-code -k 2h                    # warm with a 2h hold and exit (pre-demo)
+#
+# With no -m, the model already resident on the GPU is used. That is deliberate:
+# OLLAMA_MAX_LOADED_MODELS is 1, so naming a different model silently evicts the
+# warm one and pays the multi-minute reload -- which is exactly what you do not
+# want to discover in front of an audience.
+set -euo pipefail
+
+# Step onto the server's node. The SLURM_* scrub is load-bearing: if this is run
+# from inside another allocation -- a VSCode remote session on a compute node,
+# an interactive srun -- the nested srun inherits the OUTER job's SLURM_JOB_ID
+# and step context and dies with exit 192, even though --jobid names a different
+# job explicitly. Clearing the inherited variables makes it behave like a call
+# from the login node.
+srun_on_server() {
+    (
+        for v in $(env | grep -oE '^SLURM_[A-Z_0-9]+' || true); do unset "$v"; done
+        exec srun --jobid="$JOB_ID" --overlap "$@"
+    )
+}
+
+MODEL=""
+WORKDIR="$PWD"
+KEEPALIVE=""
+PROFILE=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -m|--model)     MODEL="$2"; shift 2 ;;
+        -d|--dir)       WORKDIR="$2"; shift 2 ;;
+        -k|--keepalive) KEEPALIVE="$2"; shift 2 ;;
+        -p|--profile)   PROFILE="$2"; shift 2 ;;
+        -h|--help)
+            echo "usage: ollama-code [-m model] [-d dir] [-k duration] [-p single|accel] [message...]"
+            exit 0
+            ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+MESSAGE="$*"
+
+# Find the server. Ask Slurm rather than reading a state file: a state file goes
+# stale the moment a job ends, squeue never does.
+#
+# Both profiles can be up at once, in which case accel wins by default -- it is
+# the one you went out of your way to start. Use -p to name the other.
+case "$PROFILE" in
+    "")      SEARCH="ollama_serve_accel ollama_serve" ;;
+    accel)   SEARCH="ollama_serve_accel" ;;
+    single)  SEARCH="ollama_serve" ;;
+    *) echo "usage: -p takes 'single' or 'accel'" >&2; exit 2 ;;
+esac
+
+JOB_ID=""
+for NAME in $SEARCH; do
+    JOB_ID="$(squeue -u "$USER" -n "$NAME" -t RUNNING -h -o '%i' | head -1)"
+    [ -n "$JOB_ID" ] && { JOB_NAME="$NAME"; break; }
+done
+
+if [ -z "$JOB_ID" ]; then
+    echo "No matching Ollama server is running. Start one with:" >&2
+    echo "    ollama-up          (1 GPU, c3_short)" >&2
+    echo "    ollama-up accel    (4 GPUs, c3_accel -- gpt-oss:120b)" >&2
+    exit 1
+fi
+
+# With two servers up, say which one this is talking to. Guessing wrong here
+# means loading a 65 GB model onto the wrong node.
+OTHER="$(squeue -u "$USER" -n ollama_serve,ollama_serve_accel -t RUNNING -h -o '%i' | wc -l)"
+[ "$OTHER" -gt 1 ] && [ -z "$PROFILE" ] && \
+    echo "(two servers up; using ${JOB_NAME}. Use -p single|accel to choose.)" >&2
+
+NODE="$(squeue -j "$JOB_ID" -h -o '%N')"
+echo "Using ${JOB_NAME} job ${JOB_ID} on ${NODE}" >&2
+
+# With no explicit model, adopt whatever is already resident.
+if [ -z "$MODEL" ]; then
+    MODEL="$(srun_on_server --quiet \
+        bash -lc 'source ~/.bashrc >/dev/null 2>&1; ollama ps' 2>/dev/null \
+        | awk 'NR==2 {print $1}')"
+    if [ -n "$MODEL" ]; then
+        echo "Adopting resident model: ${MODEL}" >&2
+    else
+        MODEL="qwen3-coder:30b"
+        [ "$JOB_NAME" = "ollama_serve_accel" ] && MODEL="gpt-oss:120b"
+        echo "Nothing resident; will load ${MODEL} (first load is slow)" >&2
+    fi
+fi
+
+# Optional pre-warm. --keepalive is PER REQUEST: every later call that omits it
+# -- and opencode omits it on every call -- resets the hold to OLLAMA_KEEP_ALIVE
+# (20m). Use this before a demo so the load cost is paid up front.
+if [ -n "$KEEPALIVE" ]; then
+    echo "Warming ${MODEL} with a ${KEEPALIVE} hold..." >&2
+    srun_on_server --quiet bash -lc \
+        "source ~/.bashrc; ollama run --keepalive '${KEEPALIVE}' --hidethinking '${MODEL}' 'Reply with exactly: OK'" \
+        >/dev/null 2>&1
+    srun_on_server --quiet bash -lc 'source ~/.bashrc; ollama ps' >&2
+    # Warming is a standalone act: stop here rather than dropping into the TUI,
+    # so this is safe to run from a script or a non-interactive shell.
+    [ -z "$MESSAGE" ] && exit 0
+fi
+
+if [ -n "$MESSAGE" ]; then
+    # One-shot. No TUI, so no pty needed.
+    srun_on_server --quiet bash -lc \
+        "source ~/.bashrc; cd '${WORKDIR}'; opencode run -m 'ollama/${MODEL}' -- '${MESSAGE}'"
+else
+    # TUI. --pty is what makes the terminal interactive through Slurm.
+    srun_on_server --quiet --pty bash -lc \
+        "source ~/.bashrc; cd '${WORKDIR}'; opencode"
+fi

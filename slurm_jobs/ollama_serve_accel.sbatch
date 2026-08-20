@@ -7,7 +7,10 @@
 #SBATCH --partition=c3_accel
 #SBATCH --time=0-08:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
+# 8, not 16. Measured: this server sits at ~0.1% CPU while holding a 70 GB model
+# at 100% GPU. compute306 has 96 CPUs and is shared -- do not reserve what you
+# will not use. Memory stays large: page cache for the mmap'd weights.
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH -o slurm_jobs/logs/ollama_serve_accel_out.txt
 #SBATCH -e slurm_jobs/logs/ollama_serve_accel_err.txt

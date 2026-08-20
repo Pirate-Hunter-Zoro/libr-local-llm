@@ -2,10 +2,19 @@
 # Single-GPU Ollama server. Daily driver for the coding assistant.
 # Submit from the repo root: sbatch slurm_jobs/ollama_serve.sbatch
 #SBATCH --job-name=ollama_serve
-#SBATCH --partition=c3
+# c3_short and c3 are the SAME six nodes (compute300-305, 1x A40 each); they
+# differ only in time limit -- 9 h vs 7 d -- and in how contended they are.
+# c3_short is far shallower, so a short-lived server schedules sooner there.
+# Switch to c3 if you ever want this to outlive 9 hours.
+#SBATCH --partition=c3_short
 #SBATCH --time=0-08:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+# 4, not 8. With weights fully on the GPU the server sits near 0.1% CPU; the one
+# heavy phase is the cold model load, which is disk-I/O bound rather than CPU
+# bound. An 8-CPU ask left this job queued behind nodes whose A40 was idle but
+# which had only 4 free CPUs. Memory stays generous: it is page cache for the
+# mmap'd weights, which is what makes a reload fast.
+#SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH -o slurm_jobs/logs/ollama_serve_out.txt
 #SBATCH -e slurm_jobs/logs/ollama_serve_err.txt

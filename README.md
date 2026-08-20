@@ -60,6 +60,11 @@ each step are in the numbered sections below.
    directory and litters the repo.
 10. **Write the opencode config** (§6), including the `enabled_providers` allowlist. Verify with
     `opencode models` on the server's node: exactly three `ollama/` entries, nothing remote.
+11. **Put the repo's `bin/` on `PATH`.** Append it inside the `# >>> ollama >>>` block in `~/.bashrc`
+    (§3). **This step is required, not cosmetic** — the driver commands (§4a) live in the repo rather
+    than in `~/bin` so they stay tracked in git, which means nothing finds them until `PATH` says
+    where they are. After this, steps 7 and 8 above collapse into `ollama-up` and `ollama-code`.
+    A clone on a fresh account is not usable until this is done.
 
 ---
 
@@ -97,6 +102,7 @@ Nothing here required admin rights.
 | Ollama client identity | `~/.ollama/` | ed25519 keypair only, ~200 KB. **Not** model storage |
 | opencode CLI | `~/.nvm/versions/node/v24.15.0/bin/opencode` | v1.18.18, `npm install -g opencode-ai` |
 | opencode config | `~/.config/opencode/opencode.json` | tracked copy in `config/opencode.json` |
+| Driver commands | `bin/ollama-up`, `bin/ollama-code`, `bin/ollama-down` | tracked here; put `bin/` on `PATH` (§3). See §4a |
 | Pre-existing HF models | `/media/studies/ehr_study/analysis/mferguson/models/` | whisper, pyannote, embedders, and `google_medgemma-27b-text-it` (safetensors, for vllm) |
 
 ### Installing ollama from scratch
@@ -129,7 +135,8 @@ A delimited `# >>> ollama >>>` block in `~/.bashrc` sets these. A backup of the 
 
 | Variable | Value | Why |
 | --- | --- | --- |
-| `PATH` | prepend `$HOME/bin` | reach the binary |
+| `PATH` | **prepend** `$HOME/bin` | reach the ollama binary |
+| `PATH` | **append** `$HOME/libr-local-llm/bin` | reach the driver commands (§4a). See below — this one has three constraints |
 | `OLLAMA_MODELS` | `/media/studies/.../models/ollama` | weights on studies, not the 100 GB home share |
 | `OLLAMA_HOST` | `127.0.0.1:11500` | non-default port avoids collisions on shared nodes; **loopback keeps a PHI-processing endpoint off the cluster network** |
 | `OLLAMA_CONTEXT_LENGTH` | `65536` | ollama defaults to a few thousand tokens; an agent silently truncates its own history there |
@@ -142,16 +149,50 @@ A delimited `# >>> ollama >>>` block in `~/.bashrc` sets these. A backup of the 
 a client; the server writes the files. Start the server from a shell that has not sourced `.bashrc`
 and 117 GB lands in `~/.ollama`.
 
+### The `bin/` PATH entry (three constraints, all deliberate)
+
+The driver commands live in the repo, not in `~/bin`, so that they stay tracked in git and are
+reviewable alongside the sbatch files they drive. The cost is that `PATH` has to point at them, and
+the line that does it is fussier than it looks:
+
+1. **Reference it through `$HOME`, not the storage path.** `$HOME/libr-local-llm` and
+   `/mnt/dell_storage/homefolders/.../libr-local-llm` are the *same directory* — same inode, two
+   mounts. Hardcoding the `/mnt` form works but bakes in a mount layout for no benefit.
+2. **Append, never prepend.** `$HOME/bin` is prepended because the ollama binary must win. The repo's
+   `bin/` is appended so that repo contents can never shadow a system command — a file added here
+   later should not silently outrank one in `/usr/bin`.
+3. **Guard it with an `if` block, not `[ -d … ] && …`.** The `&&` form returns non-zero when the
+   directory is absent, and this is the last executable line in the block — so sourcing `.bashrc`
+   would exit non-zero and abort a batch job running under `set -e`. That is trap §7.6 in a new
+   costume. The `if` form returns zero either way.
+
+Verified: the commands resolve in a fresh login shell and on a compute node, and sourcing `.bashrc`
+under `set -e` returns zero both with the directory present and with it missing.
+
 ---
 
 ## 4. Serving
 
 Two Slurm jobs. Submit **from the repo root** — the log paths are relative.
 
-| Job | Partition | GPUs | Use |
-| --- | --- | --- | --- |
-| `slurm_jobs/ollama_serve.sbatch` | `c3` | 1 | daily driver (qwen3-coder, medgemma) |
-| `slurm_jobs/ollama_serve_accel.sbatch` | `c3_accel` | 4 | `gpt-oss:120b` only |
+| Job | Partition | GPUs | CPUs | Use |
+| --- | --- | --- | --- | --- |
+| `slurm_jobs/ollama_serve.sbatch` | `c3_short` | 1 | 4 | daily driver (qwen3-coder, medgemma) |
+| `slurm_jobs/ollama_serve_accel.sbatch` | `c3_accel` | 4 | 8 | `gpt-oss:120b` only |
+
+**On the partition choice.** `c3` and `c3_short` are two queues over the *same six nodes*
+(compute300–305, one A40 each). They differ only in time limit — 7 days versus 9 hours — and in how
+contended they are: `c3` was carrying 201 running jobs against `c3_short`'s 13 when this was
+measured. A server that lives under 9 hours schedules sooner on `c3_short`, so that is the default.
+Switch the file to `c3` if you want one to outlive that; `ollama-up` rejects a `single` walltime over
+9 h rather than letting Slurm return a partition-limit error that does not say what to change.
+
+**On the CPU ask.** Both jobs used to reserve far more CPU than they use. Measured on a live server
+holding a 70 GB model at 100% GPU: **0.1% CPU, 73 MB RSS, node load 0.00.** With weights on the GPU
+the host does almost nothing, and the one expensive phase — the cold model load — is disk-I/O bound,
+not CPU bound. This is not a micro-optimization: an 8-CPU ask left the single-GPU job **queued behind
+two nodes whose A40 was idle but which had only 4 free CPUs.** Memory stays generous on purpose; it
+is page cache for the mmap'd weights, which is what makes a reload fast.
 
 Both source `~/.bashrc` (batch jobs do not do this automatically), guard on `OLLAMA_MODELS`, and run
 `ollama serve` **in the foreground** — backgrounding it would let the script exit and Slurm would
@@ -163,29 +204,107 @@ The accel job additionally exports `OLLAMA_SCHED_SPREAD=1` to force sharding acr
 
 1. `squeue -u $USER` → note the node (e.g. `compute300`) and confirm `gres/gpu:N`.
 2. Read `slurm_jobs/logs/ollama_serve_err.txt` — ollama logs to **stderr**. Look for
-   `Listening on 127.0.0.1:11500` and an `inference compute ... NVIDIA A40` line.
-3. `ssh <node>` and use the client from there.
+   `Listening on 127.0.0.1:11500`.
+3. Step onto the node (see below) and use the client from there.
+
+In practice you should not do any of this by hand — `ollama-up` (§4a) does all three and refuses to
+report success unless they all pass.
 
 ### Reaching the server
 
 The endpoint is **loopback on the job's node**. From any other node the connection is refused —
-this is deliberate, not a bug. SSH to the node holding the job (permitted on this cluster, verified)
-and run the client there. Do **not** rebind to `0.0.0.0`: that exposes a PHI-processing endpoint to
-every user on the cluster.
+this is deliberate, not a bug. Do **not** rebind to `0.0.0.0`: that exposes a PHI-processing endpoint
+to every user on the cluster.
+
+Two ways onto the node. **Prefer the first.**
+
+- **`srun --jobid=<id> --overlap`** steps into the existing allocation and runs a command there. No
+  SSH key, no password, and it inherits the job's `CUDA_VISIBLE_DEVICES`. Add `--pty` for anything
+  interactive (a TUI needs it). This is what `ollama-code` uses.
+- **`ssh <node>`** also works *if* your key agent is set up. It is not always: a non-interactive SSH
+  from the login node was refused with `Permission denied (publickey,password)` while `srun
+  --overlap` to the same node succeeded in the same shell. Treat SSH as the fallback.
 
 ### Verifying a 4-GPU shard
 
-**Not yet performed** — the accel job has never been submitted (§8). What follows is the acceptance
-criterion to check the first time it runs, not a record of observed behavior.
+**Verified 2026-08-20** on compute306, job 2041641, `gpt-oss:120b`. Observed, not specified:
 
-After one prompt to `gpt-oss:120b`, on compute306:
+| Check | Observed |
+| --- | --- |
+| `nvidia-smi` per-card VRAM | 18877 / 17139 / 17205 / 16573 MiB — 16–18 GB on each of four cards |
+| `ollama ps` | `100% GPU`, 70 GB, context 65536 |
+| GPU detection | 4× A40, `compute=8.6`, `cuda_v13` backend, driver 13.3 |
 
-- `nvidia-smi` should show roughly **16–18 GB on each of four cards**. One card near 46 GB with three
-  idle means the spread did not take.
-- `ollama ps` must report `100% GPU`. Any CPU offload means it fell back and will be unusably slow.
+`OLLAMA_SCHED_SPREAD=1` engages as intended. One card near 46 GB with three idle would mean it had
+not; any CPU offload in `ollama ps` would mean it fell back and would be unusably slow.
+
+Cold-start cost, same run: **total 5m00s, of which load was 4m46s** — 65.4 GB paging off the NFS
+studies share at roughly 230 MB/s. Warm generation ran at 34.1 tok/s. That load figure is the whole
+argument for warming a model *before* a demo rather than during one (§4a).
 
 `CUDA_VISIBLE_DEVICES` indices are **relative to the allocation**, not physical device numbers —
 Slurm remaps them. Never hardcode a device index.
+
+---
+
+## 4a. Driver commands (`bin/`)
+
+Three tracked scripts wrap everything above. They run **from anywhere, including the login node** —
+they find the job through `squeue` and step onto its node with `srun --overlap`.
+
+**They are not on `PATH` by default.** They live in the repo rather than `~/bin` so they stay under
+version control, which means `~/.bashrc` has to be told where they are — §3 covers the line and the
+three constraints on it. Until that is done, they only work when called by path from the repo root.
+Once it is, none of §4's manual steps need doing by hand again.
+
+Deliberately **no state file**: the client asks Slurm which job is running every time. A state file
+goes stale the moment a job ends or a second one is submitted; `squeue` never does.
+
+| Command | Does |
+| --- | --- |
+| `ollama-up [single\|accel] [hours]` | Submits the matching sbatch, waits for `RUNNING`, asserts `AllocTRES` contains `gres/gpu=`, waits for `Listening on` in the stderr log. Exits non-zero unless the server is actually serving. Optional walltime in hours overrides the file's 8 h. Reports the pending reason while it waits, and leaves the job queued if it gives up. |
+| `ollama-code [-m model] [-d dir] [-k dur] [-p single\|accel] [message…]` | Finds the running server and launches opencode on its node. No message → the TUI. A message → a one-shot `opencode run`. |
+| `ollama-down [all\|single\|accel]` | Cancels the server jobs. Run it when done — compute306 is the only 4-GPU node. |
+
+Behaviors worth knowing:
+
+- **`ollama-up` refuses to double-submit.** `OLLAMA_MAX_LOADED_MODELS` is 1 and both profiles bind
+  the same loopback port, so a second server is never useful. It also truncates the stderr log first,
+  because the readiness check greps for `Listening on` and a stale hit from the previous job would
+  report success before the new server had started.
+- **`ollama-code` adopts the resident model** when `-m` is absent, reading it from `ollama ps`.
+  Naming a different model evicts the warm one and pays the multi-minute reload — not something to
+  discover mid-demo. With nothing resident it falls back to the profile's default.
+- **`ollama-code -k <duration>` warms and exits.** Use it before a demo. It sends one throwaway
+  prompt with `--keepalive` so the load cost is paid up front, then stops rather than dropping into
+  the TUI, which makes it safe to call from a script.
+- `ollama-up` prefers `--chdir` over a `cd`, since §4's log paths are relative to the repo root, and
+  captures the job id via `sbatch --parsable` rather than parsing "Submitted batch job N".
+- **Both scripts scrub `SLURM_*` before shelling out**, which is what lets them run from inside
+  another allocation. See trap §7.19 — this is not defensive garnish, the unscrubbed version fails.
+
+---
+
+## 4b. Working from an editor on a compute node
+
+The common case: a VSCode remote session whose workspace is served from an interactive job on some
+compute node, while the model server holds a *different* node. The endpoint is loopback on the
+server's node, so the editor's node cannot reach it directly — and the two nodes are not the same
+one.
+
+The driver commands already handle this. From the VSCode terminal, `ollama-code` finds the server
+through `squeue` and hops to its node with `srun --overlap`, exactly as it would from the login node.
+Nothing about the editor's own allocation needs changing, and no port forwarding is involved.
+
+Two things to know:
+
+- **Your files are visible from both nodes.** Home and `/media/studies` are network filesystems
+  mounted everywhere, so the opencode session started on the server's node sees the same workspace.
+  Pass the workspace path with `-d` if you launch from somewhere else; the default is the current
+  directory, which is usually what you want.
+- **This is the case that trips trap §7.19.** Running Slurm commands from inside an allocation is
+  what breaks without the `SLURM_*` scrub. Verified working from compute302 against a server on
+  compute306.
 
 ---
 
@@ -195,11 +314,18 @@ Slurm remaps them. Never hardcode a device index.
 | --- | --- | --- |
 | `qwen3-coder:30b` | 18.6 GB | Default coding model. MoE, 30B total / ~3B active, tuned for agentic tool-calling. Fits one A40 with room for a 64k context |
 | `medgemma:27b-it-q8_0` | 29.6 GB | Clinical prototyping. q8, not q4 — quantization damage shows up first on careful text extraction |
-| `gpt-oss:120b` | 65.4 GB | Strongest coder available here. MoE. **Requires `c3_accel`** |
+| `gpt-oss:120b` | 65.4 GB | Strongest coder available here. MoE. **Requires `c3_accel`**. Reasoning model — `ollama run` exposes `--think` (true/false or high/medium/low) and `--hidethinking` |
+
+The store on disk is ~131 GB, larger than the sum of the tags above: `blobs/` also holds layers that
+no current manifest points at.
 
 Pull with `ollama pull <tag>` from a shell on the node running the server. A server must already be
 running — no GPU needed for a pull, it is network and disk only. Pulls are chunked and resumable;
 re-running the same tag continues from an orphan blob rather than restarting.
+
+**Cold loads are slow and it is the studies share, not the GPUs.** `gpt-oss:120b` took 4m46s to page
+65.4 GB off NFS (~230 MB/s) before its first token. Warm it before you need it — `ollama-code -k`
+(§4a) exists for exactly that.
 
 `ollama list` shows only *completed* models — the manifest is written last. Mid-flight, the store
 directory will be larger than the sum of listed models.
@@ -277,6 +403,32 @@ Do not re-learn these.
 13. **conda envs are not Python venvs.** `setup_envs.sh` in PSYCH-ASR creates *conda* prefix envs; a
     conda env can hold compiled binaries (which is why it was a candidate for `zstd`), a `python -m
     venv` cannot.
+14. **`--keepalive` is per *request*, not per session.** It sets the hold for that one call. Any
+    later request that omits it — and **opencode omits it on every call** — resets the model's expiry
+    to `OLLAMA_KEEP_ALIVE` (20 m). Warming a model two hours before a demo and then poking it once
+    through opencode drops the hold back to 20 minutes, so it evicts before the audience arrives and
+    you pay the ~5-minute reload live.
+15. **GPU discovery in ollama 0.32.14 is lazy.** The `inference compute ... NVIDIA A40` lines appear
+    when the *first model loads*, not at startup. A freshly started server logs `Listening on` and
+    then `discovering available GPUs...` and stops. An absent A40 line at that point means nothing
+    has loaded yet, **not** that the GPUs were missed.
+16. **SSH to a compute node is not guaranteed; `srun --overlap` is.** A non-interactive SSH from the
+    login node was refused (`publickey,password`) while `srun --jobid=<id> --overlap` reached the same
+    node from the same shell. Build tooling on `srun`, not `ssh`.
+17. **Grepping a Slurm log for a readiness string needs the log truncated first.** `Listening on`
+    from the *previous* job is still sitting in the file and will report success before the new
+    server has started. `ollama-up` empties the stderr log before submitting.
+18. **`ollama run` writes a spinner to the captured stream.** Piping it to a file yields tens of
+    thousands of ANSI escape sequences around the actual answer. Strip escapes before reading it
+    programmatically, or the timings block is unfindable.
+19. **Slurm commands run *inside* an allocation inherit `SLURM_*` and misbehave.** This is the one
+    that bites when your editor is already on a compute node (§4b). A nested `srun --jobid=<other>
+    --overlap` dies with **exit 192** despite naming a different job explicitly, because it picks up
+    the outer job's `SLURM_JOB_ID` and step context. Worse and quieter: `sbatch` inherits the outer
+    job's `SLURM_*` too, and those **override the `#SBATCH` directives in the file** — a server
+    submitted from a compute-node terminal can come up with the wrong partition, memory, or GPU
+    count and never say so. Both `ollama-up` and `ollama-code` unset every `SLURM_*` variable before
+    shelling out. Verified failing and then passing from compute302 against a server on compute306.
 
 ---
 
@@ -298,10 +450,15 @@ Do not re-learn these.
   copy of `google_medgemma-27b-text-it` is already staged and vllm consumes it directly — at bf16
   (~55 GB) it needs two A40s with tensor parallelism. Intended workflow: prototype prompts against
   ollama q8, run production passes on vllm bf16.
-- **The 4-GPU shard is unverified.** `gpt-oss:120b` finished downloading, but
-  `ollama_serve_accel.sbatch` has never been submitted and no prompt has ever reached the model. The
-  acceptance criteria in §4 are therefore a *specification*, not an observation. This is also the
-  cheapest available rehearsal for the vllm work above, which needs tensor parallelism across two
-  A40s on the same node.
-- **Walltime.** Both jobs are 8 h. `c3` and `c3_accel` allow up to 7 days if a longer-lived server
-  is wanted.
+- **Walltime.** Both sbatch files default to 8 h. `c3` and `c3_accel` allow up to 7 days if a
+  longer-lived server is wanted; `ollama-up` takes an hours argument for shorter ones, which is the
+  right choice on `c3_accel` since compute306 is the only 4-GPU node.
+- **`ollama-code` cannot pick the model for the TUI.** opencode's `--model` flag exists on its `run`
+  subcommand but not on the bare TUI invocation, so `-m` only takes effect for one-shot prompts. In
+  the TUI you get `config/opencode.json`'s default and change it from the in-app picker. Making `-m`
+  work there means writing the default into the config before launching, which is a config mutation
+  and has not been done.
+
+The 4-GPU shard and one-command serving both used to live in this section. They are done (§4, §4a);
+the shard verification also stands as the rehearsal for the vllm tensor-parallel work above, and
+says the multi-GPU path on this hardware is sound.
