@@ -367,6 +367,39 @@ Pro/Max subscriptions through it, and the plugins that did so were removed in 1.
 supported Anthropic path is a per-token API key. Claude Code (LIBR seat) and opencode+ollama are
 separate tools with a clean split: Claude Code for non-PHI work, opencode for anything local.
 
+### Web access: decided scope (2026-08-20, not yet applied)
+
+The intent is to let the coding assistant reach the web. Recorded here as a decision so the
+reasoning survives the config change.
+
+**Permissions are per *agent*, not per model.** There is no setting that grants web access to
+`qwen3-coder:30b`. Any model can be driven by any agent, so the boundary that matters is the
+*workload*, not the weights: a `coder` agent running medgemma is fine, a transcript-coding agent
+running qwen3 is not. "Enable web for all our models" does not map onto anything opencode exposes,
+and thinking in those terms is how the wrong agent ends up with the wrong tool.
+
+Two distinct risks, and the second is the one usually missed:
+
+- **Egress.** Anything in the context window can leave in a search query or a fetch URL. §1 confirms
+  outbound HTTPS works from compute nodes, so opencode's config is the *only* thing keeping PHI on
+  the cluster.
+- **Ingress — prompt injection.** Fetched pages enter the context as text the model cannot
+  distinguish from your instructions. The `coder` agent has file and shell access, so every page it
+  reads becomes a potential instruction source. This risk is present even with no PHI anywhere near
+  the session.
+
+What will change, and what deliberately will not:
+
+| Setting | Decision |
+| --- | --- |
+| Top-level `permission` deny | **Unchanged.** It is what closes the built-in `explore` subagent, which ships with `webfetch: allow` (trap §7.12). A per-agent-only config would leave that open. |
+| `coder` → `webfetch` | Raise `ask` → `allow`. A URL you typed is the lower-risk direction. |
+| `coder` → `websearch` | **Keep at `ask`.** This is the direction where your prompt text leaves the building. |
+| Any transcript-reading agent | Never. No web tools, ever. |
+
+**This makes layer 3 more urgent, not less** (§8). Loosening layers 1 and 2 is precisely why the
+layer that cannot be misconfigured needs to exist.
+
 ---
 
 ## 7. Traps already paid for
@@ -434,9 +467,18 @@ Do not re-learn these.
 
 ## 8. Not done yet
 
+- **Web access for the coding agent — NEXT.** Decision made and recorded in §6; the config edit
+  itself is not applied. Raise `coder`'s `webfetch` from `ask` to `allow`, leave `websearch` at
+  `ask`, and leave the top-level deny alone so the built-in `explore` subagent stays closed. Verify
+  afterwards with `opencode agent list`, which prints each agent's fully resolved rule stack: `coder`
+  should show `webfetch: allow` / `websearch: ask`, and **every other agent must still show both as
+  `deny`**. If `explore` comes back with `allow`, the global block was edited by mistake — that is
+  trap §7.12 and it is silent.
 - **The PHI boundary, layer 3.** Layers 1 and 2 are done (§6): global default-deny on `webfetch` /
   `websearch`, and a single `coder` agent that raises them to `ask`. Both are config, and config is
-  one bad edit from being wrong. The remaining layer is the one that cannot be misconfigured:
+  one bad edit from being wrong — and the web-access change above deliberately makes layer 2 weaker,
+  which raises the value of this one rather than lowering it. The remaining layer is the one that
+  cannot be misconfigured:
   **the clinical model must never run through opencode at all** — a plain Python client against the
   loopback endpoint with no tool-calling surface in the code. Nothing stops a tool-enabled agent from
   putting a transcript fragment into a search query, which is an exfiltration event under
