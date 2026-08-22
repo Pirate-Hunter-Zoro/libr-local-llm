@@ -22,6 +22,13 @@ appears, it uses this too.
 > for. No empirical results, no findings, no model-quality claims. Sizes, ports, walltimes, and
 > resource asks are architecture and belong here.
 
+> **Where the next phase is planned.** [`DESIGN.md`](DESIGN.md) holds the design for **the fleet** —
+> a preemption-aware service running all three engines (ollama, vllm, colibrì) across the cluster's
+> GPUs, acquiring nodes when they are free and yielding them when somebody else needs them. It is
+> design only; **nothing in it is built.** This README stays the record of what *exists*, and the two
+> must not be read as one document. Durable facts graduate from `DESIGN.md` into here when a piece
+> is built and verified. (Added 2026-08-22.)
+
 ---
 
 ## 0. Bootstrap from zero (order matters)
@@ -76,7 +83,11 @@ each step are in the numbered sections below.
 | GPU partitions | `c3_short` (9 h cap), `c3` (7 d cap), `c3_accel` (7 d cap) |
 | `c3` / `c3_short` nodes | 6 nodes, **1× NVIDIA A40 (46 GB) each**, ~1 TB RAM |
 | `c3_accel` node | **compute306 only**, **4× A40**, 96 CPUs, 1 TB RAM |
+| CPU (every node) | 2× Intel Xeon Gold 6342 @ 2.80 GHz — 24 cores/socket, 96 threads, **2 NUMA nodes**, **AVX-512 with VNNI** |
+| GPU compute capability | **8.6** (Ampere), driver 610.43.02. No FP8 tensor cores — AWQ/GPTQ int4, int8 and bf16 are the usable formats |
+| GPU interconnect | **NVLink reports all links inactive.** Cross-GPU traffic goes over PCIe, so tensor parallelism pays an all-reduce tax on every layer |
 | GPU isolation | **None.** `nvidia-smi` shows a node's GPUs whether or not you reserved one |
+| Node-local scratch | **None.** `TmpDisk=0`, and `/` is a RAM-backed tmpfs. Every cold model load is an NFS read |
 | `/tmp` | RAM-backed **tmpfs**, node-local, vanishes with the node. Never write logs there |
 | Home | NFS, 100 GB share. Not a model store |
 | Studies share | `/media/studies` → `/mnt/dell_storage/studies`, ~16 TB free |
@@ -462,11 +473,38 @@ Do not re-learn these.
     submitted from a compute-node terminal can come up with the wrong partition, memory, or GPU
     count and never say so. Both `ollama-up` and `ollama-code` unset every `SLURM_*` variable before
     shelling out. Verified failing and then passing from compute302 against a server on compute306.
+20. **Loopback is not a security boundary on a shared node.** (Added 2026-08-22.) Slurm gives a job
+    no network namespace, so *any* user with a shell on the node running the server can connect to
+    `127.0.0.1:11500` on it. §4's "the endpoint is loopback, from any other node the connection is
+    refused" is true and is a real control against the *cluster network* — it is not a control
+    against the *node's other users*, and this README previously read as though it were both. The
+    honest statement: loopback is necessary and not sufficient, and **ollama has no authentication
+    at all**, so today the only thing between another account on compute30x and our endpoint is that
+    they have no reason to look. Two consequences: keep the endpoint on the least-populated node we
+    reasonably can, and treat "does this engine support an API key" as a selection criterion for
+    anything added next (colibrì does; ollama does not). This is a live gap, not a hypothetical one.
 
 ---
 
 ## 8. Not done yet
 
+- **The fleet — the repo's next phase, designed 2026-08-22, none of it built.** All three engines
+  (ollama, vllm, colibrì) behind one front door, spread across the cluster's GPUs by a supervisor
+  that acquires nodes when they are free, **yields them when another user's job is blocked by what we
+  hold**, and regrows when it can. The full design — goals and non-goals, the placement argument, the
+  two data planes, the yield ladder, the citizenship rules, milestones with exit criteria, the
+  measurements we owe ourselves, and the traps anticipated but not yet paid for — is
+  [`DESIGN.md`](DESIGN.md). Read that before writing any of it. Three things from it that change how
+  the items below should be read:
+  - **Replicas, not shards.** With NVLink inactive (§1), independent single-GPU replicas beat
+    tensor parallelism for any model that fits on one card — more aggregate throughput, and a replica
+    can be surrendered one at a time where a 4-GPU job cannot. This supersedes the tensor-parallel
+    assumption in the vllm item below.
+  - **`c3_accel` is booked, never held.** Unchanged in spirit, tightened in practice.
+  - **Citizenship is the core feature.** The hardware is already bought and already powered; the real
+    cost of this service is other people's queue time, plus our own fair-share, which the *research*
+    jobs then pay for. A fleet that has to be torn down by hand when a colleague complains has
+    already failed.
 - **Web access for the coding agent — NEXT.** Decision made and recorded in §6; the config edit
   itself is not applied. Raise `coder`'s `webfetch` from `ask` to `allow`, leave `websearch` at
   `ask`, and leave the top-level deny alone so the built-in `explore` subagent stays closed. Verify
@@ -489,9 +527,17 @@ Do not re-learn these.
   "Stage 4".) Ollama is right for interactive single-user coding. Batch transcript work
   wants vllm: continuous batching for throughput, and guided decoding against a JSON schema so the
   model is structurally incapable of emitting anything but a valid rating object. The HF safetensors
-  copy of `google_medgemma-27b-text-it` is already staged and vllm consumes it directly — at bf16
-  (~55 GB) it needs two A40s with tensor parallelism. Intended workflow: prototype prompts against
-  ollama q8, run production passes on vllm bf16.
+  copy of `google_medgemma-27b-text-it` is already staged and vllm consumes it directly. Intended
+  workflow: prototype prompts against ollama q8, run production passes on vllm bf16.
+  **Revised 2026-08-22:** at bf16 (~55 GB) MedGemma 27B does not fit one A40, so it needs either two
+  cards with tensor parallelism *or* 8-bit weights and a single card. `DESIGN.md` §4.2 argues for the
+  second — one card per replica, several replicas — because on a PCIe-only host replicas are both
+  faster in aggregate and yieldable one at a time. The 4-GPU shard verification (§4) stands either
+  way; it says the multi-GPU path works, not that we should prefer it.
+  `DESIGN.md` §5.3 also changes *how* the batch pass is driven: a filesystem work queue on the
+  studies share rather than a network service. That is not a detour — it delivers the layer-3 PHI
+  property above as a consequence of the architecture (there is no socket to misconfigure) instead of
+  as a discipline someone has to maintain.
 - **Walltime.** Both sbatch files default to 8 h. `c3` and `c3_accel` allow up to 7 days if a
   longer-lived server is wanted; `ollama-up` takes an hours argument for shorter ones, which is the
   right choice on `c3_accel` since compute306 is the only 4-GPU node.
@@ -502,5 +548,6 @@ Do not re-learn these.
   and has not been done.
 
 The 4-GPU shard and one-command serving both used to live in this section. They are done (§4, §4a);
-the shard verification also stands as the rehearsal for the vllm tensor-parallel work above, and
-says the multi-GPU path on this hardware is sound.
+the shard verification says the multi-GPU path on this hardware is sound, which is worth having
+established even though `DESIGN.md` now argues for replicas over sharding wherever a model fits on
+one card. Knowing that the option works is what makes declining to use it a choice.
