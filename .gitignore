@@ -27,3 +27,6 @@ Thumbs.db
 __pycache__/
 *.pyc
 node_modules/
+
+# live tutoring board (Tutor-Board) — scratch space, never tracked
+live/
