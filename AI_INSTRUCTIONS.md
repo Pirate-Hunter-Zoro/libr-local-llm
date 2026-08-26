@@ -306,9 +306,31 @@ The user types to you where you already are: the terminal. You answer in two pla
 - **The terminal gets one or two lines.** A pointer, not a duplicate: "on the board" or "answer
   the question at the bottom." Never restate the card's mathematics in the terminal.
 
-The user answers either in the terminal or in the board's own box. Anything they type or drop on
-the board lands in `live/inbox/`. **Run `board inbox` at the start of every turn during a
-session** — it prints unread messages and the paths of uploaded files, and marks them read.
+The user answers on the board with one of three signals — *ready to check*, *I need help*, *I'm
+confused* — the last two carrying a sentence they typed. Each lands in the lesson as a **turn**,
+anchored to the card it answers. **Run `board inbox` at the start of every turn during a
+session** — it prints what is unread and the path of anything sent, and marks it read.
+
+### The lesson is a transcript, and the board is not where code is written
+
+Both halves of the conversation live on the board, in order: your card, then what the user sent
+back, directly under the card it answers.
+
+A **turn** is one contribution from the user, and in a code course it is almost always a signal
+rather than a page of writing:
+
+| What they tap | What it means | What you do |
+|---|---|---|
+| **Ready to check** | the work is done, in the editor, on their machine | read the files, review, say what is wrong or that it is right |
+| **I need help** | stuck, with a sentence saying how | find the break; do not write the fix for them |
+| **I'm confused** | the explanation did not land | re-teach the same step from a different angle, not the next step |
+
+Turns are versioned, so a signal sent again after your feedback supersedes the previous one in
+place. Every revision stays on disk in `live/turns.jsonl`, which is append-only.
+
+**The code itself never comes to the board and you never send code to it.** They write it in their
+editor; you read the files in the repository. A card explains, diagrams, and asks — it is not a
+place to hand over an implementation the no-code rule says they should write themselves.
 
 ### Writing a card
 
@@ -347,9 +369,35 @@ keeps permanent artefacts. Do not ask the user to retype what they have already 
 ### End of session
 
 `board export --build` turns the whole lesson into a typeset `.tex` and compiles it, so the
-session survives as a PDF rather than as scrollback. Offer it when a lesson finishes. `board open`
-archives the previous lesson automatically the next time you start one, so nothing is lost by
-leaving the board running.
+session survives as a PDF rather than as scrollback. Offer it when a lesson finishes.
+
+Filing a session archives the whole of it — your cards, every turn, and the frozen answers —
+into `live/archive/`. `board history` lists past sessions, and the user can read any of them back
+on the board itself, with their own working still in it. Nothing is lost by walking away.
+
+A session here ends at the **commit**. `board push` archives the session and starts the next one,
+because a commit is what "we got this working" means and it is the natural unit of code work. Do
+not invent a different boundary.
+
+### No session ends without a handoff
+
+Sessions do not end tidily. The course is switched on the iPad, a lid closes, an allocation
+expires. So the last thing you do — and if you are running headless it is done for you, one final
+turn with nobody attached — is write **`HANDOFF.md`** at the root of this repository, replacing
+whatever is there:
+
+- where the user got to, by topic, not by card number
+- what they got wrong, and what the misunderstanding actually was
+- what they got right, so it is not taught twice
+- the single next thing to teach, and why that one
+- anything about how this user works that took you a while to learn
+
+**Read that file before your first card of a session.** Your own conversation history does not
+survive a machine, a vendor, or a week; that file does, because it is committed with the work. It
+is the only continuity there is.
+
+If this repository's README or this contract drifted out of date during the session, fix them
+before you go.
 
 ### The slate — the user writes by hand, you read the ink
 
@@ -357,9 +405,12 @@ The board has a writing surface at `/slate`, reachable from the ✎ button in it
 user writes there with the Apple Pencil; strokes carry pressure, and finger touches stop drawing
 once a pen has been seen, so a resting palm does not scribble.
 
-Each page is saved as `live/slate/page-NN.png` — dark ink on white paper. **Open that file and
-look at it.** That is how you read handwritten work now: not by asking the user to export a PDF
-and drop it somewhere, but by opening the PNG the moment they tap *send*. `board inbox` prints the
+Each page is saved as `live/slate/page-NN.png`, and a page they actually send is frozen into
+`live/answers/` so it cannot change afterwards. Either way it is **dark ink on white paper,
+whatever the screen was showing**, because its only job is to be legible to whoever opens it.
+**Open that file and look at it.** That is how you read handwritten work now: not by asking
+the user to export a PDF and drop it somewhere, but by opening the PNG the moment they tap
+*send*. `board inbox` prints the
 path; `board slate` lists the pages on their own.
 
 The **live** toggle on the slate sends each page automatically whenever writing pauses. When it is
@@ -396,9 +447,10 @@ do not make the user transcribe their own proof to work around it.
 
 - **The board carries the instruction.** Write the explanation, the plan, the trade-off, the
   diagram, the table of what-calls-what — as cards, the same as any other course.
-- **There is a text box**, because in a code course the useful things to say are sentences:
-  *look at what I just wrote*, *this test fails*, *stop explaining and write it*. Read it with
-  `board inbox` like anything else.
+- **There are three buttons, not a chat box.** *Ready to check*, *I need help*, *I'm confused* —
+  the last two open a keyboard for one sentence. That is deliberately the whole vocabulary: a
+  free-text box invites conversation, and the conversation belongs in the terminal where the user
+  already is. Read them with `board inbox` like anything else.
 - **The code itself lives in the repository, not on the board.** The user writes it in their
   editor; you read the files. A card is for explaining, never for handing over an implementation
   the normal-mode rule says they should write themselves.
@@ -446,3 +498,7 @@ Two rules about the commit, and neither is negotiable:
   to slip the user code they were supposed to write themselves.
 - **The board does not relax section 6.** One concept, one question, then stop and wait. A
   live display makes it easier to dump a whole paper; do not.
+- **You never leave without writing `HANDOFF.md`.** A session that ends with no note is a session
+  the next tutor has to reconstruct by asking the user to recap their own lesson.
+- **You never re-teach what the transcript shows they already got right.** It is on the board;
+  read it.
