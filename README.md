@@ -115,6 +115,7 @@ Nothing here required admin rights.
 | opencode config | `~/.config/opencode/opencode.json` | tracked copy in `config/opencode.json` |
 | Driver commands | `bin/ollama-up`, `bin/ollama-code`, `bin/ollama-down` | tracked here; put `bin/` on `PATH` (§3). See §4a |
 | Pre-existing HF models | `/media/studies/ehr_study/analysis/mferguson/models/` | whisper, pyannote, embedders, and `google_medgemma-27b-text-it` (safetensors, for vllm) |
+| colibrì upstream checkout | `~/colibri` | ~65 MB. Read-only clone of `github.com/JustVugg/colibri`, kept current by a daily user timer (§2.1). Nothing here runs it yet — see §8 |
 
 ### Installing ollama from scratch
 
@@ -136,6 +137,43 @@ URL redirects to a GitHub release asset that 404s.
 nvm; the global prefix is inside `$HOME`, so no sudo and it is visible on every node. npm warns that
 a postinstall script was blocked — **ignore it**; the platform binary arrives as an optional
 dependency and works.
+
+### 2.1 Keeping the colibrì checkout current
+
+(Added 2026-08-30.) `~/colibri` is a plain clone of the upstream engine, tracking `main`. It is
+fast-forwarded **once a day, automatically**. This is unrelated to any tutoring or serving process
+and shares nothing with them: its own script, its own log, its own timer.
+
+| Piece | Path |
+| --- | --- |
+| The script | `~/.local/bin/colibri-pull` |
+| Log (one line per run) | `~/.local/state/colibri-pull.log` |
+| Once-a-day guard | `~/.local/state/colibri-pull.stamp` |
+| Timer + service units | `~/.config/systemd/user/colibri-pull.{timer,service}` |
+
+`colibri-pull` is fast-forward-only and never fatal: a dirty tree or a diverged branch is logged and
+left alone, because merging somebody else's repository is not a decision a timer gets to make.
+`colibri-pull --force` runs it by hand regardless of the day guard.
+
+**Why a systemd `--user` timer and not cron.** `crontab` is refused on this cluster — *"You
+(mferguson) are not allowed to access to (crontab) because of pam configuration"* — so cron was
+never available to us. The user timer is what is left, and it needs two deliberate settings to work
+on a machine like this:
+
+- **`Persistent=true`, which is the load-bearing one.** The account has `Linger=no`, so the systemd
+  user manager exists only while a session does, and a compute node's allocation takes it away
+  besides. A timer alone would therefore not be running at midnight and would simply never fire.
+  `Persistent=true` records the last run in `~/.local/share/systemd/timers/`, and **that path is on
+  the shared home** — so a *different* node, on a *later* day, reads the same record, sees the run is
+  overdue, and fires it at login. The node is disposable; the record is not.
+- **A small `RandomizedDelaySec` (2m).** The jitter's usual job — spreading load across many
+  machines — buys one user with one repository nothing, and a delay longer than a short editor
+  session would let the day's pull be missed entirely.
+
+Net effect: at most one pull per day, taken on the first login of the day on whatever node you land
+on, or at 00:00 if you happen to already be logged in. Verified 2026-08-30 by backdating the
+persistent record three days and cold-starting the timer: it fired at once, then re-armed for the
+following day.
 
 ---
 
@@ -483,6 +521,15 @@ Do not re-learn these.
     they have no reason to look. Two consequences: keep the endpoint on the least-populated node we
     reasonably can, and treat "does this engine support an API key" as a selection criterion for
     anything added next (colibrì does; ollama does not). This is a live gap, not a hypothetical one.
+
+21. **There is no cron here, and a user timer does not survive on its own.** (Added 2026-08-30.)
+    `crontab` is blocked by PAM for this account, and `Linger=no` means the systemd user manager
+    dies with your last session — on a compute node it dies with the allocation regardless. So
+    "schedule it for 3am" is not a thing this cluster can do for a user account: nothing of ours is
+    running at 3am. Anything recurring must be written to *catch up when a session next exists*
+    (`Persistent=true`, whose record lives on the shared home and therefore survives the node), and
+    must be idempotent for the period, because two logins on two nodes in one day will otherwise run
+    it twice. §2.1 is the worked example.
 
 ---
 
