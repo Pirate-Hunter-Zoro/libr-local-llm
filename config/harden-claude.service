@@ -1,0 +1,6 @@
+[Unit]
+Description=Audit the Claude Code permission fencing (once a day)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/harden-claude

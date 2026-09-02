@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+#  harden-claude -- run the Claude Code permission audit, at most once a day.
+#
+#  Wired to a systemd --user timer (harden-claude.timer), mirroring
+#  colibri-pull: same stamp-file guard, same log convention, same reason for a
+#  user timer rather than cron (crontab is refused by pam on this cluster).
+#  The stamp makes a second run the same day a no-op, so it is also safe from a
+#  login hook or by hand.
+#
+#      harden-claude            audit if it has not already run today
+#      harden-claude --force    audit regardless
+#
+#  The audit itself lives in the repository, at scripts/harden-claude.sh, so
+#  what runs on a timer and what is documented are the same file.
+#
+#  Unlike colibri-pull this one is DELIBERATELY fatal on a real problem: it
+#  exits non-zero so the unit lands in `systemctl --user --failed`, which is
+#  the only passive way anybody notices that the PHI guard stopped working.
+#  A log nobody reads is not a notification.
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+REPO="${HARDEN_REPO:-$HOME/libr-local-llm}"
+AUDIT="$REPO/scripts/harden-claude.sh"
+STAMP="$HOME/.local/state/harden-claude.stamp"
+LOG="$HOME/.local/state/harden-claude.log"
+FORCE=0
+[ "${1:-}" = "--force" ] && FORCE=1
+
+mkdir -p "$(dirname "$LOG")"
+say() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+
+today="$(date '+%Y-%m-%d')"
+if [ "$FORCE" -eq 0 ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$today" ]; then
+  exit 0
+fi
+
+if [ ! -f "$AUDIT" ]; then
+  say "no audit script at $AUDIT"
+  exit 1
+fi
+
+# Record the stamp before interpreting the result: a failing audit should not
+# re-run on every login all day, it should report once and stay reported.
+printf '%s\n' "$today" > "$STAMP"
+
+out="$(bash "$AUDIT" 2>&1)"
+rc=$?
+
+problems="$(printf '%s' "$out" | sed -n 's/^ *problems *: *\([0-9]*\).*/\1/p' | tail -1)"
+changed="$(printf '%s' "$out"  | sed -n 's/^ *changes made *: *\([0-9]*\).*/\1/p' | tail -1)"
+warns="$(printf '%s' "$out"    | grep -c '^   WARN ')"
+stale="$(printf '%s' "$out"    | sed -n 's/.*WARN *\([0-9]*\) stale transcript.*/\1/p' | tail -1)"
+
+say "audit rc=$rc problems=${problems:-?} changed=${changed:-0} warnings=$warns stale=${stale:-0}"
+
+# On a real failure, keep the evidence next to the summary. Warnings are
+# expected steady state (the unread ACL, a flagged key) and stay terse.
+if [ "$rc" -ne 0 ] || [ "${problems:-0}" -gt 0 ]; then
+  printf '%s' "$out" | grep '^   FAIL ' | while IFS= read -r line; do say "  $line"; done
+  say "  full output: bash $AUDIT"
+  exit 1
+fi
+
+exit 0

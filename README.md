@@ -182,6 +182,37 @@ on, or at 00:00 if you happen to already be logged in. Verified 2026-08-30 by ba
 persistent record three days and cold-starting the timer: it fired at once, then re-armed for the
 following day.
 
+### 2.2 Keeping the Claude Code fencing honest
+
+(Added 2026-09-02.) The permission audit in [`scripts/harden-claude.sh`](scripts/harden-claude.sh)
+runs **once a day, automatically**, on the same machinery as §2.1 and for the same reason: crontab
+is refused by pam on this cluster, so a systemd `--user` timer with `Persistent=true` is what is
+left. See §2.1 for why that setting is load-bearing — the argument is identical and is not repeated
+here.
+
+| Piece | Path |
+| --- | --- |
+| The wrapper (day guard, logging) | `~/.local/bin/harden-claude` |
+| The audit itself | `libr-local-llm/scripts/harden-claude.sh` |
+| Log (one line per run) | `~/.local/state/harden-claude.log` |
+| Once-a-day guard | `~/.local/state/harden-claude.stamp` |
+| Timer + service units | `~/.config/systemd/user/harden-claude.{timer,service}` |
+| Tracked copies, for a rebuild | [`config/harden-claude*`](config/) |
+
+The wrapper is a day guard and a log line; the audit lives in this repository, so what runs on the
+timer and what is documented are the same file. `harden-claude --force` runs it regardless of the
+day guard.
+
+**One deliberate difference from `colibri-pull`: this one is fatal on a real problem.** A failed
+pull is benign and is only logged. A missing PHI guard is not, so the wrapper exits non-zero and
+the unit lands in `systemctl --user --failed`, which is the only passive way anybody finds out. A
+log nobody reads is not a notification. Warnings — the unread home ACL, a flagged key — are steady
+state and stay a terse count on one line.
+
+What it checks, and what it refuses to do on a timer, is in
+[`PERMISSIONS.md`](PERMISSIONS.md) §6. The short version: it reports and it repairs file modes, it
+never deletes.
+
 ---
 
 ## 3. Environment (`~/.bashrc`)

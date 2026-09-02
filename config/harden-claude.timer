@@ -1,0 +1,14 @@
+[Unit]
+Description=Daily Claude Code permission audit
+
+[Timer]
+OnCalendar=daily
+# The account has Linger=no, so the user manager only exists while a session
+# does. Persistent=true records the last run under ~/.local/share/systemd/,
+# which is on the shared home -- so a different node on a later day sees the
+# run is overdue and fires it at login. Same reasoning as colibri-pull.timer.
+Persistent=true
+RandomizedDelaySec=2m
+
+[Install]
+WantedBy=timers.target

@@ -192,6 +192,19 @@ What it checks:
 
 Exit 1 means the PHI guard is unsound. Nothing should run in `PSYCH-ASR` until it exits 0.
 
+### It runs on a timer
+
+Once a day, via a systemd `--user` timer, on the same machinery as the colibrì pull and for the
+same reason — crontab is refused by pam on this cluster. `README.md` §2.2 has the wiring;
+`~/.local/bin/harden-claude` is the day-guard wrapper and the audit itself stays in this
+repository, so the file on the timer and the file documented here are one file.
+
+The wrapper exits non-zero when the audit reports a problem, which puts the unit in
+`systemctl --user --failed`. That is deliberate and it is the whole notification design: nobody
+reads `~/.local/state/harden-claude.log` unprompted, so a guard that quietly stopped working would
+stay quietly stopped. Warnings — the unread home ACL, a flagged key — are steady state and stay a
+count on one line rather than a failure.
+
 ### What it deliberately does not do
 
 - **It does not rewrite transcripts.** An earlier draft redacted secrets from them in place. That
