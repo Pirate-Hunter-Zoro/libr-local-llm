@@ -227,15 +227,38 @@ plausible false positive, and real key formats are matched by their own prefixes
 
 ## 8. What this configuration does not solve
 
-The home tree on the `dell_storage` homefolders mount is mode `rwxrwx---`, group `domain users`,
-and the mode is enforced below the client: `chmod` does not stick, `setfacl` does not stick, and
-there is no POSIX default ACL to strip. Every member of that group can read **and write** the
-home tree.
+Session transcripts under `~/.claude/projects/` hold whatever reached the assistant's context,
+including sessions in `PSYCH-ASR` that predate the guard in §1. The guard stops future reads; it
+does nothing about the archive. That is the standing gap, and closing it means deciding whether
+to delete transcripts — a tradeoff against losing session history, and a person's call.
 
-That bounds everything above. Session transcripts hold whatever reached the assistant's context,
-including sessions in `PSYCH-ASR` that predate the guard. And a hook someone else can edit is a
-hook in name only — the integrity of §1 rests on file permissions this account does not control.
+### Trap: `rwxrwx---` on this filer does not mean what it says
 
-The guard raises the floor. The ceiling is set by the filesystem, and moving it is a
-conversation with whoever administers the mount, not a change to any file in this repository.
-`harden-claude.sh` prints the text for that conversation.
+The home tree reports mode `rwxrwx---` with group `domain users`, a group with 130 members. An
+earlier version of this document concluded from that alone that 130 people could read and write
+the home tree, and said so twice, in public commits. That conclusion was wrong.
+
+The mount is NFSv4 on an Isilon. Access is decided by an NFSv4 ACL, and the POSIX mode the client
+displays is a lossy synthesis of that ACL rather than the thing being enforced. The measurement
+that settles it, which `harden-claude.sh` now performs:
+
+| Check | Result |
+|---|---|
+| Am I in `domain users`? | yes, it is the primary group |
+| Peer homes showing the same `rwxrwx---` and group | 79 |
+| …that deny me anyway | 70 |
+| …that let me in | 9 |
+
+If the group bits were live, membership would open all 79. Seventy refuse, so the bits are
+decorative and the ACL defaults to closed. The nine are individual choices by their owners, not
+the platform's default.
+
+Two lessons worth more than the finding. A mode is evidence about a filesystem's *conventions*,
+not proof of access — the only proof is attempting the access. And the test that produced the
+false alarm was itself broken: `id -Gn | tr ' ' '\n' | grep -x 'domain users'` splits a group name
+that contains a space and returns a confident false negative. Compare group membership by GID.
+
+What remains genuinely unknown: this home's own ACL cannot be read from the account that owns it,
+because `nfs4_getfacl` is not installed. Unverified is not the same as exposed, and it is not the
+same as safe either. `harden-claude.sh` prints the question to send the storage administrators —
+phrased as a question, since that is what it is.

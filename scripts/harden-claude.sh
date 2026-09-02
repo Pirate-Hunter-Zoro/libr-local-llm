@@ -191,12 +191,21 @@ done
 [ "$tracked_any" -eq 0 ] && ok "no repository tracks a .claude settings file"
 
 # ---------------------------------------------------------------------------
-# 4. Home directory exposure -- audit, and fix only if the filesystem allows
+# 4. Home directory exposure -- audit only, and do not jump to conclusions
 #
-# On this cluster the home tree is group rwx for `domain users` and the mode is
-# enforced below the client: chmod does not stick and there is no POSIX default
-# ACL to strip. The probe below establishes which world we are in rather than
-# assuming, so this script stays correct on a machine where chmod does work.
+# The home tree reports mode rwxrwx--- with group `domain users`, which reads
+# like 130 people can rummage through it. On this filer that inference is
+# WRONG, and an earlier version of this script made it loudly.
+#
+# The mount is NFSv4 on an Isilon. Access is decided by an NFSv4 ACL; the POSIX
+# mode the client displays is a lossy *synthesis* of that ACL, not the thing
+# being enforced. The proof is below: this account is a member of
+# `domain users`, peer home directories show exactly the same group rwx mode,
+# and listing them is denied anyway.
+#
+# So the script measures, states what it cannot determine, and stops. Whether
+# THIS home's ACL grants the group anything cannot be answered from inside the
+# account, because there is nobody else here to test it with.
 # ---------------------------------------------------------------------------
 head2 "Home directory exposure"
 
@@ -205,6 +214,57 @@ say "   $(mode_of "$HOME")   \$HOME"
 say "   $(mode_of "$CLAUDE_DIR")   ~/.claude"
 say "   $(mode_of "$TRANSCRIPTS")   ~/.claude/projects"
 
+fstype="$(findmnt -T "$HOME" -no FSTYPE 2>/dev/null)"
+say "   filesystem: ${fstype:-unknown}"
+
+# Am I in the group the mode is granting rights to? Note the group name
+# contains a space, so compare by GID -- splitting `id -Gn` on whitespace
+# silently breaks "domain users" in half and reports a false negative.
+home_gid="$(stat -c '%g' "$HOME" 2>/dev/null)"
+home_grp="$(stat -c '%G' "$HOME" 2>/dev/null)"
+if id -G 2>/dev/null | tr ' ' '\n' | grep -qx "$home_gid"; then
+  in_group=1
+  say "   you ARE a member of '$home_grp' (gid $home_gid)"
+else
+  in_group=0
+  say "   you are NOT a member of '$home_grp' (gid $home_gid)"
+fi
+
+# Do the mode bits actually decide anything? Test against peers that show the
+# same mode. If the group bit were enforced, membership would get us in.
+peers_same_mode=0
+peers_denied=0
+for d in "$(dirname "$HOME")"/*/; do
+  [ -d "$d" ] || continue
+  [ "$(basename "$d")" = "$(basename "$HOME")" ] && continue
+  [ "$(stat -c '%g' "$d" 2>/dev/null)" = "$home_gid" ] || continue
+  case "$(stat -c '%A' "$d" 2>/dev/null)" in
+    drwxrwx*) peers_same_mode=$((peers_same_mode + 1))
+              ls "$d" >/dev/null 2>&1 || peers_denied=$((peers_denied + 1)) ;;
+  esac
+done
+
+peers_open=$((peers_same_mode - peers_denied))
+if [ "$in_group" = 1 ] && [ "$peers_same_mode" -gt 0 ]; then
+  say "   peers with the same mode: $peers_same_mode ($peers_denied deny you, $peers_open let you in)"
+  # A single readable peer proves nothing: users can open their own directory.
+  # What matters is which way the filer leans by default.
+  if [ "$((peers_denied * 100 / peers_same_mode))" -ge 75 ]; then
+    ok "the POSIX mode is synthetic -- you are in '$home_grp', these homes all"
+    ok "show group rwx, and $peers_denied of $peers_same_mode deny you anyway"
+    ok "-> an NFSv4 ACL decides access here, and it defaults to closed"
+    say "   the $peers_open open one(s) are individual choices, not the default"
+    warn "THIS home's ACL still cannot be read from the account that owns it"
+    warn "(nfs4_getfacl is not installed) -- unverified, not proven safe"
+  else
+    bad "$peers_open of $peers_same_mode peer homes are readable by you"
+    bad "-> group access looks live on this filer; assume yours is too"
+  fi
+else
+  warn "could not establish whether the mode bits are enforced here"
+fi
+
+# chmod failing is expected on ACL-backed storage and is not itself a finding.
 probe_file="$CLAUDE_DIR/.permtest-$STAMP"
 if touch "$probe_file" 2>/dev/null; then
   chmod 600 "$probe_file" 2>/dev/null
@@ -225,10 +285,8 @@ if [ "$probe_mode" = "-rw-------" ]; then
     did "tightened ~/.claude to owner-only"
   fi
 else
-  warn "chmod does NOT stick (a fresh file came back as ${probe_mode})"
-  warn "the mode is enforced on the mount and this account cannot revoke it"
-  warn "group 'domain users' can read AND write everything under \$HOME,"
-  warn "including this hook and your shell profile -- see the handover below"
+  say "   chmod does not stick (a fresh file came back as ${probe_mode})"
+  say "   -- normal on ACL-backed storage, and not evidence of exposure"
 fi
 
 # ---------------------------------------------------------------------------
@@ -237,29 +295,31 @@ fi
 head2 "Left for you"
 
 cat <<'HANDOVER'
-   1. Revoke any key section 2 flagged. Tailscale admin console -> Settings ->
-      Keys, and issue a fresh one if a node still needs to join. No script can
-      do this; it needs an authenticated console session. Rotation is the fix.
-      Deleting the transcript is not.
+   1. Rotate whatever section 2 flagged, in whichever system issued it. Check
+      what the secret actually gates before deciding urgency -- a value passed
+      as `--secret` may be an application's own shared secret rather than a
+      cloud credential, and the two carry very different risk. Rotation is the
+      fix either way; deleting the transcript is not.
 
-   2. If section 4 reported that chmod does not stick, send the storage
-      administrators the text below.
+   2. Ask the storage administrators the questions below. This is a question,
+      not an incident report: section 4 establishes that the POSIX mode is
+      synthetic on this filer, so the real ACL on your home is unknown from
+      here rather than known to be bad.
 
       ----------------------------------------------------------------
-      My home directory on the dell_storage homefolders mount is mode
-      rwxrwx--- with group 'domain users', and the mode is enforced below
-      the client: chmod and setfacl both fail to change it, and there is no
-      POSIX default ACL to strip.
+      My home directory on the homefolders NFSv4 mount shows mode rwxrwx---
+      with group 'domain users'. I understand the mode is a synthesis of the
+      underlying NFSv4 ACL rather than the ACL itself -- I am in that group,
+      and peer home directories showing the same mode correctly deny me.
 
-      Two questions:
-        - Is group access on home directories intentional? Every member of
-          'domain users' can currently read and write my home tree.
-        - Should PHI-derived artifacts live on this mount at all? Session
-          logs and analysis outputs under my home fall under the same
-          group permissions.
+      I cannot read the actual ACL from my account (nfs4_getfacl is not
+      installed), so two questions:
 
-      The write bit concerns me most: files I rely on for integrity,
-      including a security hook and my shell profile, are group-writable.
+        - What does the ACL on my home directory actually grant, and to whom?
+        - Analysis outputs derived from identifiable recordings live under my
+          home. If the ACL grants anything beyond me, is this mount an
+          appropriate location for them, or should they move to a share with
+          an explicit access list?
       ----------------------------------------------------------------
 
    3. Decide what to do with transcripts predating the PHI guard. Sessions run
