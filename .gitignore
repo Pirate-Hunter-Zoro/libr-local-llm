@@ -11,6 +11,7 @@ slurm_jobs/logs/*
 *.mp3
 *.json
 !config/opencode.json
+!config/claude-settings.json
 *.jsonl
 *.csv
 *.gguf

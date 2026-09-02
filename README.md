@@ -29,6 +29,13 @@ appears, it uses this too.
 > must not be read as one document. Durable facts graduate from `DESIGN.md` into here when a piece
 > is built and verified. (Added 2026-08-22.)
 
+> **How the assistant is fenced in.** [`PERMISSIONS.md`](PERMISSIONS.md) is the architecture record
+> for Claude Code's permission configuration on this account: which commands skip the prompt, which
+> paths are refused outright, and the `PreToolUse` hook that makes `PSYCH-ASR` diarization and ASR
+> outputs unreadable no matter which interpreter is asked to open them. Verbatim copies of the hook
+> and the user-level settings live in [`config/`](config/), because `~/.claude/` is gitignored
+> everywhere and the configuration would otherwise not survive a rebuild. (Added 2026-09-02.)
+
 ---
 
 ## 0. Bootstrap from zero (order matters)
