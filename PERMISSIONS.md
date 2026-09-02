@@ -176,13 +176,66 @@ was written. Plan for a mistake in a hook to take effect at once.
 
 ---
 
-## 6. Rebuilding this on a new machine
+## 6. The audit script
+
+[`scripts/harden-claude.sh`](scripts/harden-claude.sh) verifies all of the above and fixes what
+is safe to fix without a decision. It is idempotent, and re-running it *is* the audit.
+`--dry-run` reports without writing.
+
+What it checks:
+
+1. the hook is present, executable, registered, and behaves on 8 probe cases
+2. transcripts under `~/.claude/projects/` for credential-shaped strings
+3. every committed `.claude/settings*.json`, with repository visibility, for secrets
+4. whether `chmod` is honoured on this filesystem, tightening `~/.claude` where it is
+
+Exit 1 means the PHI guard is unsound. Nothing should run in `PSYCH-ASR` until it exits 0.
+
+### What it deliberately does not do
+
+- **It does not rewrite transcripts.** An earlier draft redacted secrets from them in place. That
+  is log tampering wearing a hygiene costume, and it fixes nothing: once a key has sat in a
+  directory other people can read, rotation is the only remedy, after which the recorded copy is
+  inert. The script reports and names the rotation step instead.
+- **It does not add a gitignore rule for `.claude/settings.json`.** Several repositories here
+  track that file on purpose — one commit says so outright, *"board settings survive the dotfile
+  ignore"*. Overriding a deliberate decision is not hardening, and an ignore rule cannot untrack
+  a committed file in any case. The script audits the committed blobs for secrets instead, which
+  is the risk that actually exists.
+- **It does not delete anything.** Transcripts predating the guard are an exposure with a cost on
+  both sides, so the script names the tradeoff and leaves the call to a person.
+
+### Trap: a secret regex tuned too loose is worse than none
+
+The first version matched `sk-[A-Za-z0-9_-]{24,}` and reported twelve compromised transcripts.
+All 71 hits were one PDF filename containing the letters `sk-str`. A scanner that cries wolf gets
+ignored, which is strictly worse than not running it. Every pattern is now set above the longest
+plausible false positive, and real key formats are matched by their own prefixes.
+
+---
+
+## 7. Rebuilding this on a new machine
 
 1. Copy [`config/block-phi.py`](config/block-phi.py) to `~/.claude/hooks/block-phi.py` and mark
    it executable.
 2. Copy [`config/claude-settings.json`](config/claude-settings.json) to `~/.claude/settings.json`,
    correcting the absolute path in the `hooks.PreToolUse` command to the new home.
-3. Confirm `skipDangerousModePermissionPrompt` is `false`.
-4. Verify by feeding the hook JSON on stdin and checking exit codes — 2 is a refusal, 0 is a
-   pass. The two cases that matter most: a heredoc opening a diarized JSON must refuse, and a
-   pipeline script running over an RTTM input must pass.
+3. Run [`scripts/harden-claude.sh`](scripts/harden-claude.sh). It confirms the rest, including
+   that `skipDangerousModePermissionPrompt` is `false`, and reports anything it cannot fix.
+
+---
+
+## 8. What this configuration does not solve
+
+The home tree on the `dell_storage` homefolders mount is mode `rwxrwx---`, group `domain users`,
+and the mode is enforced below the client: `chmod` does not stick, `setfacl` does not stick, and
+there is no POSIX default ACL to strip. Every member of that group can read **and write** the
+home tree.
+
+That bounds everything above. Session transcripts hold whatever reached the assistant's context,
+including sessions in `PSYCH-ASR` that predate the guard. And a hook someone else can edit is a
+hook in name only — the integrity of §1 rests on file permissions this account does not control.
+
+The guard raises the floor. The ceiling is set by the filesystem, and moving it is a
+conversation with whoever administers the mount, not a change to any file in this repository.
+`harden-claude.sh` prints the text for that conversation.
