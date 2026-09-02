@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+#  colibri-pull -- fast-forward ~/colibri, at most once a day.
+#
+#  Nothing to do with the tutoring board. Wired to a systemd --user timer
+#  (colibri-pull.timer); the stamp file makes a second run the same day a no-op,
+#  so it is safe to call from a login hook as well, or by hand when impatient.
+#
+#      colibri-pull            pull if it has not already run today
+#      colibri-pull --force    pull regardless
+#
+#  Never fatal, and never clever: a dirty tree or a diverged branch is reported
+#  and left alone. Merging somebody else's repository is not a decision a timer
+#  gets to make.
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+REPO="${COLIBRI_REPO:-$HOME/colibri}"
+STAMP="$HOME/.local/state/colibri-pull.stamp"
+LOG="$HOME/.local/state/colibri-pull.log"
+FORCE=0
+[ "${1:-}" = "--force" ] && FORCE=1
+
+mkdir -p "$(dirname "$LOG")"
+say() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+
+today="$(date '+%Y-%m-%d')"
+if [ "$FORCE" -eq 0 ] && [ "$(cat "$STAMP" 2>/dev/null)" = "$today" ]; then
+  exit 0
+fi
+
+[ -d "$REPO/.git" ] || { say "no repository at $REPO"; exit 0; }
+cd "$REPO" || exit 0
+
+# A tree with local work in it is not something a timer should touch.
+if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+  say "skipped: working tree is dirty"
+  printf '%s\n' "$today" > "$STAMP"
+  exit 0
+fi
+
+export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false
+before="$(git rev-parse HEAD 2>/dev/null)"
+if out="$(git pull --ff-only 2>&1)"; then
+  after="$(git rev-parse HEAD 2>/dev/null)"
+  if [ "$before" = "$after" ]; then
+    say "already current (${after:0:8})"
+  else
+    n="$(git rev-list --count "$before..$after" 2>/dev/null)"
+    say "pulled ${before:0:8} -> ${after:0:8} ($n commit(s))"
+  fi
+  printf '%s\n' "$today" > "$STAMP"
+else
+  say "pull did not run: $(printf '%s' "$out" | tail -1)"
+fi
+exit 0

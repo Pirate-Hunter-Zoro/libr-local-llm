@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily pull of ~/colibri
+
+[Timer]
+OnCalendar=daily
+# Catch up after a login if the machine was not up at the scheduled time.
+Persistent=true
+RandomizedDelaySec=2m
+
+[Install]
+WantedBy=timers.target

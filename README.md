@@ -157,6 +157,13 @@ and shares nothing with them: its own script, its own log, its own timer.
 | Log (one line per run) | `~/.local/state/colibri-pull.log` |
 | Once-a-day guard | `~/.local/state/colibri-pull.stamp` |
 | Timer + service units | `~/.config/systemd/user/colibri-pull.{timer,service}` |
+| Tracked copies, for a rebuild | [`config/colibri-pull*`](config/) |
+
+Everything in the table above lives outside this repository, so verbatim copies are tracked
+under [`config/`](config/) — `~/.local/bin` and `~/.config/systemd` are not backed up by
+anything, and a documented timer whose script is gone rebuilds into a dead unit. Same
+arrangement as §2.2 and as the Claude Code fencing in `PERMISSIONS.md`. The copies are
+reference, not the running article: if you edit one, install it and check `diff`.
 
 `colibri-pull` is fast-forward-only and never fatal: a dirty tree or a diverged branch is logged and
 left alone, because merging somebody else's repository is not a decision a timer gets to make.

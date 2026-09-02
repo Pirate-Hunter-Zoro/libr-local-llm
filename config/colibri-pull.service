@@ -1,0 +1,6 @@
+[Unit]
+Description=Fast-forward ~/colibri (once a day)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/colibri-pull
