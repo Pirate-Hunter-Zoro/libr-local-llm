@@ -188,6 +188,7 @@ What it checks:
 2. transcripts under `~/.claude/projects/` for credential-shaped strings
 3. every committed `.claude/settings*.json`, with repository visibility, for secrets
 4. whether `chmod` is honoured on this filesystem, tightening `~/.claude` where it is
+5. stale session transcripts and the size of the prompt log (see §8)
 
 Exit 1 means the PHI guard is unsound. Nothing should run in `PSYCH-ASR` until it exits 0.
 
@@ -225,12 +226,36 @@ plausible false positive, and real key formats are matched by their own prefixes
 
 ---
 
-## 8. What this configuration does not solve
+## 8. Session history is disposable
 
-Session transcripts under `~/.claude/projects/` hold whatever reached the assistant's context,
-including sessions in `PSYCH-ASR` that predate the guard in §1. The guard stops future reads; it
-does nothing about the archive. That is the standing gap, and closing it means deciding whether
-to delete transcripts — a tradeoff against losing session history, and a person's call.
+Decided 2026-09-02. Session transcripts under `~/.claude/projects/` are not part of the record.
+Every repository here documents itself — README, `DESIGN.md`, the contract files — so the durable
+account of what was built lives in git, and a transcript is only a log of how it came to be
+written. Against that near-zero value, transcripts accumulate whatever reached the assistant's
+context, which for `PSYCH-ASR` meant diarization output from sessions predating the guard in §1.
+
+The archive was purged on 2026-09-02: 95 transcripts, 201 MB, plus `~/.claude/history.jsonl`, the
+prompt log that records every command typed. Three transcripts were spared as live or recently
+touched. `~/.claude/projects/` went from 235 MB to 51 MB.
+
+**`harden-claude.sh` reports; it does not delete.** That asymmetry is deliberate. An audit you are
+told to re-run must never be the thing that destroys data, and this directory holds transcripts
+belonging to other people's live sessions — losing a colleague's in-flight work to a routine audit
+is not a trade worth the seconds it saves. §5 of the script counts what is eligible, excludes the
+current session and anything touched in the last 30 minutes, and prints the command.
+
+### Trap: `find` here is `bfs`
+
+The purge was first written with `! -newermt '30 minutes ago'`. On these nodes `find` is `bfs`,
+which rejects relative timestamps outright — so the predicate errored, the eligible list came back
+empty, and *the spare-list came back empty too*. Had the delete not been gated on a count, it
+would have run with no exclusions and taken the live sessions with it. Use `-mmin`, which both
+implementations accept, and never let a delete depend on a predicate whose failure mode is an
+empty exclusion set.
+
+---
+
+## 9. What this configuration does not solve
 
 ### Trap: `rwxrwx---` on this filer does not mean what it says
 

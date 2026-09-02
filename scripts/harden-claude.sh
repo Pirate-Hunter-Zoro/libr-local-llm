@@ -7,8 +7,8 @@
 #
 # Idempotent, and re-running is the point: it doubles as the audit. The only
 # things it writes are a gitignore line and file modes, both backed up or
-# reversible. It deliberately does NOT rewrite session transcripts -- see
-# section 2.
+# reversible. It never deletes and never rewrites a transcript -- sections 2
+# and 5 report; removal stays a deliberate act.
 #
 # Exit 0 when everything it can fix is fixed. Exit 1 when the PHI guard is
 # missing or misbehaving, because that is not a warning, it is a broken fence.
@@ -290,7 +290,66 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. What only a human can do
+# 5. Session history
+#
+# Policy, decided 2026-09-02: session transcripts are disposable here. Every
+# repository on this account documents itself -- README, DESIGN, the contract
+# files -- so the durable record is in git, and a transcript is only a log of
+# how that record came to be written. Against that they accumulate whatever
+# reached the assistant's context, which for PSYCH-ASR meant diarization output
+# from sessions predating the guard in section 1.
+#
+# The script REPORTS what is eligible and prints the command. It does not
+# delete on its own, and that is deliberate: an audit you are told to re-run
+# should never be the thing that destroys data, and transcripts belonging to
+# other people's live sessions share this directory. Losing a colleague's
+# in-flight session to a routine audit is not a trade worth making for the few
+# seconds it saves.
+# ---------------------------------------------------------------------------
+head2 "Session history"
+
+LIVE_WINDOW_MIN=30   # a transcript touched this recently may be a live session
+
+if [ ! -d "$TRANSCRIPTS" ]; then
+  ok "no transcript directory"
+else
+  self="${CLAUDE_CODE_SESSION_ID:-nomatch}"
+  # NOTE: `find` on these nodes is bfs, which rejects relative -newermt
+  # timestamps ("30 minutes ago") with an error rather than matching nothing.
+  # -mmin is portable across both and fails safe.
+  eligible="$(find "$TRANSCRIPTS" -name '*.jsonl' -type f \
+                   ! -mmin "-$LIVE_WINDOW_MIN" ! -name "*${self}*" 2>/dev/null | wc -l)"
+  live="$(find "$TRANSCRIPTS" -name '*.jsonl' -type f -mmin "-$LIVE_WINDOW_MIN" 2>/dev/null | wc -l)"
+
+  if [ "$eligible" -eq 0 ]; then
+    ok "no stale transcripts ($live live or recent, left alone)"
+  else
+    mb="$(find "$TRANSCRIPTS" -name '*.jsonl' -type f \
+               ! -mmin "-$LIVE_WINDOW_MIN" ! -name "*${self}*" -printf '%s\n' 2>/dev/null \
+          | awk '{s+=$1} END {printf "%.0f", s/1048576}')"
+    warn "$eligible stale transcript(s), ${mb} MB, eligible for removal"
+    say  "   $live left alone (this session, or touched in the last ${LIVE_WINDOW_MIN}m)"
+    say  "   to purge them:"
+    say  "     find ~/.claude/projects -name '*.jsonl' -type f \\"
+    say  "          ! -mmin -${LIVE_WINDOW_MIN} ! -name \"*\$CLAUDE_CODE_SESSION_ID*\" -delete"
+  fi
+
+  # The prompt log is the same class of record: it stores every command typed,
+  # which is where a secret pasted onto a command line comes to rest.
+  # Claude Code recreates this file as soon as you type, so its existence is
+  # not a finding. Its size is: a large one has been accumulating for months.
+  PROMPT_LOG="$CLAUDE_DIR/history.jsonl"
+  log_kb=$(( $(stat -c%s "$PROMPT_LOG" 2>/dev/null || echo 0) / 1024 ))
+  if [ "$log_kb" -gt 64 ]; then
+    warn "prompt log is ${log_kb} KB -- every command typed, secrets included"
+    say  "   to clear it:  rm -f ~/.claude/history.jsonl"
+  else
+    ok "prompt log is small (${log_kb} KB)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 6. What only a human can do
 # ---------------------------------------------------------------------------
 head2 "Left for you"
 
@@ -322,13 +381,10 @@ cat <<'HANDOVER'
           an explicit access list?
       ----------------------------------------------------------------
 
-   3. Decide what to do with transcripts predating the PHI guard. Sessions run
-      in PSYCH-ASR before the guard existed may hold diarization output in
-      their logs, in the group-readable directory above. Deleting them trades
-      exposure against losing session history, which is your call, not this
-      script's. To see the candidates:
+   3. Nothing further on session history -- policy is set (section 5) and the
+      transcripts predating the PHI guard were purged on 2026-09-02. Section 5
+      reports anything that has since accumulated and prints the command.
 
-        ls ~/.claude/projects/*PSYCH-ASR*/
 HANDOVER
 
 # ---------------------------------------------------------------------------
