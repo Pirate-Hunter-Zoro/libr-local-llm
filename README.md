@@ -79,6 +79,10 @@ each step are in the numbered sections below.
     than in `~/bin` so they stay tracked in git, which means nothing finds them until `PATH` says
     where they are. After this, steps 7 and 8 above collapse into `ollama-up` and `ollama-code`.
     A clone on a fresh account is not usable until this is done.
+12. **Source the opencode guard.** Add the `if`-block for `config/opencode-guard.sh` to the same
+    `~/.bashrc` block (§3). Not cosmetic either: without it, `opencode` run directly — which is the
+    obvious thing to type, and which nothing else stops — fails with an unreachable API and no
+    indication that `ollama-up`/`ollama-code` exist. See trap §7.22.
 
 ---
 
@@ -121,6 +125,7 @@ Nothing here required admin rights.
 | opencode CLI | `~/.nvm/versions/node/v24.15.0/bin/opencode` | v1.18.18, `npm install -g opencode-ai` |
 | opencode config | `~/.config/opencode/opencode.json` | tracked copy in `config/opencode.json` |
 | Driver commands | `bin/ollama-up`, `bin/ollama-code`, `bin/ollama-down` | tracked here; put `bin/` on `PATH` (§3). See §4a |
+| opencode guard | `config/opencode-guard.sh` | tracked here; sourced from `~/.bashrc` (§3). Turns a bare `opencode` into a pointer at the driver commands |
 | Pre-existing HF models | `/media/studies/ehr_study/analysis/mferguson/models/` | whisper, pyannote, embedders, and `google_medgemma-27b-text-it` (safetensors, for vllm) |
 | colibrì upstream checkout | `~/colibri` | ~65 MB. Read-only clone of `github.com/JustVugg/colibri`, kept current by a daily user timer (§2.1). Nothing here runs it yet — see §8 |
 
@@ -263,6 +268,43 @@ the line that does it is fussier than it looks:
 Verified: the commands resolve in a fresh login shell and on a compute node, and sourcing `.bashrc`
 under `set -e` returns zero both with the directory present and with it missing.
 
+### The `opencode` guard (why it is a function, not a script in `bin/`)
+
+The same block sources [`config/opencode-guard.sh`](config/opencode-guard.sh), which defines a shell
+function named `opencode`. Typing `opencode` directly is the obvious mistake — it is the tool's real
+name, it is on `PATH`, and it starts without complaint — and the failure it produces is useless: the
+configured endpoint is `127.0.0.1:11500`, loopback-only on whichever node holds the allocation, so
+anywhere else the TUI reports that the API could not be reached and names no node, no job, and
+neither of the two commands that would have worked.
+
+The guard intercepts exactly three cases and passes everything else through untouched:
+
+- **`opencode up …` / `down` / `code`** — the driver commands are named `ollama-*`. It prints the
+  corrected command. This is trap §7.22, which is worse than a typo because it does not error.
+- **Anything needing a live model** (no arguments, a bare directory, `run`, `serve`, `web`, `attach`)
+  when nothing answers on `OLLAMA_HOST` — it asks `squeue` whether a server is up elsewhere and
+  either names that node and says to use `ollama-code`, or says no server is running and gives the
+  `ollama-up` lines.
+- Everything else — `models`, `agent`, `providers`, `stats`, `--help` and the rest of §6's
+  verification commands — reaches the real binary directly, including from the login node.
+
+Two design constraints, both forced:
+
+1. **A function, not `bin/opencode`.** The repo's `bin/` is *appended* to `PATH` on purpose
+   (constraint 2 above), so a wrapper script there would lose to the real binary in `~/.nvm` and
+   never run. Prepending to make it win would break that constraint for every other file in `bin/`.
+   A function is consulted before `PATH` regardless of order, and `command opencode` still reaches
+   the real binary — the guard is a signpost, not a fence.
+2. **It probes with bash's own `/dev/tcp`, not `nc` or `curl` or `timeout`.** The check has to work
+   from `ollama-code`'s `bash -lc` on the server node, where it must pass straight through. No
+   timeout is needed because the endpoint is loopback by definition: the connect lands or is refused
+   at once.
+
+Verified: the corrected command for `opencode up accel`; the no-server message with nothing running;
+the named-node message against a stubbed `squeue` reporting a job on another node; pass-through for
+`opencode models` (still exactly three `ollama/` entries) and for the TUI and `run` when the port is
+answering; and `bash -lc 'set -e'` returning zero with the guard file present and absent.
+
 ---
 
 ## 4. Serving
@@ -376,6 +418,10 @@ Behaviors worth knowing:
   captures the job id via `sbatch --parsable` rather than parsing "Submitted batch job N".
 - **Both scripts scrub `SLURM_*` before shelling out**, which is what lets them run from inside
   another allocation. See trap §7.19 — this is not defensive garnish, the unscrubbed version fails.
+- **Typing `opencode` instead of `ollama-code` is caught, not punished.** A shell function sourced
+  from `~/.bashrc` (§3) answers a bare `opencode` with which node the server is on, or with the
+  `ollama-up` lines if none is. It exists because the wrong command produced an unreachable-API
+  error that pointed at nothing — see trap §7.22.
 
 ---
 
@@ -575,6 +621,16 @@ Do not re-learn these.
     (`Persistent=true`, whose record lives on the shared home and therefore survives the node), and
     must be idempotent for the period, because two logins on two nodes in one day will otherwise run
     it twice. §2.1 is the worked example.
+
+22. **`opencode up accel` does not fail — it opens a TUI in a directory called `up`.** (Added
+    2026-09-03.) opencode has no `up` subcommand, and its argument parser treats an unrecognized
+    first positional as the `[project]` directory for the default TUI command. So the typo submits
+    nothing to Slurm, discards `accel` silently, exits 0, and the damage only surfaces on the *next*
+    command as `opencode`'s unreachable-API error — which names the endpoint but not the node, the
+    job, or the fact that `ollama-up` and `ollama-code` are the commands that work. Two separate
+    footguns stacked: a subcommand that is silently reinterpreted as a path, and a client whose
+    connection failure carries no diagnosis. `config/opencode-guard.sh` (§3) closes both by
+    intercepting the `ollama-*` names and by naming the serving node before handing over.
 
 ---
 
