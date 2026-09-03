@@ -300,3 +300,63 @@ What remains genuinely unknown: this home's own ACL cannot be read from the acco
 because `nfs4_getfacl` is not installed. Unverified is not the same as exposed, and it is not the
 same as safe either. `harden-claude.sh` prints the question to send the storage administrators —
 phrased as a question, since that is what it is.
+
+---
+
+## 10. Auto mode is the default, and bypass mode is not
+
+Decided 2026-09-03. `permissions.defaultMode` was `acceptEdits` and is now `auto`, set at the
+user level so it follows the session into every repository rather than being re-chosen per
+project. `skipAutoPermissionPrompt` is `true`, which suppresses only the one-time dialog
+explaining the mode — not any of the checks the mode performs.
+
+### Why the allowlist was not enough
+
+`Bash(grep *)`, `Bash(rg *)`, `Grep`, `Glob` and `Read` were all already granted, and grep still
+prompted constantly. The reason is that a permission pattern matches a *whole* command, and a
+shell pipeline is not one command: `something | grep -v x | tail` is three, and every one of them
+has to match an allow rule or the entire pipeline goes to a prompt. Real work is pipelines, so
+the allowlist was suppressing the prompts nobody was actually hitting.
+
+The evidence is in the per-project file. `.claude/settings.local.json` in this repository had
+accumulated some fifty entries, each one a verbatim 300-character pipeline that had been approved
+once and can never match again — including `Bash(echo *)` and `Bash(grep -viE '^\s*$')`, both of
+which were *already* granted at the user level. An allowlist that grows one literal command at a
+time is a log of prompts, not a policy.
+
+### What auto mode actually is
+
+A classifier reads each proposed action and decides. Read-only work is approved without a prompt
+regardless of how the pipeline is spelled; destructive or irreversible actions still prompt.
+Critically, it is **additive to the three layers in §1, not a replacement for them**:
+
+| Layer | Still enforced under auto mode? |
+|---|---|
+| `PreToolUse` hook (`block-phi.py`) | yes — hooks run before permission resolution |
+| `permissions.deny` | yes — deny still beats everything |
+| `permissions.allow` | yes — a match short-circuits the classifier |
+
+This is the opposite of `bypassPermissions`, which removes the checks. Auto mode keeps every one
+of them and only changes who answers the routine questions. The §0 goal was to make the prompt
+rare enough that bypass mode is never worth reaching for; this is the mechanism that finally does
+it, and `skipDangerousModePermissionPrompt` stays `false` (§5) so the door to bypass mode is still
+guarded.
+
+### Trap: the classifier refuses to let the assistant edit the permission file by shell
+
+Writing this very change through a `python3` heredoc was denied by the classifier — correctly.
+A settings file that governs permissions is not ordinary data, and an agent rewriting its own
+permission grants through a shell one-liner is indistinguishable from an injected instruction
+doing the same. The change went through the `Edit` tool instead, which surfaces a reviewable diff
+rather than an opaque command string.
+
+Worth stating plainly, because the asymmetry looks arbitrary until you see the reason: the
+classifier is not judging the *outcome*, it is judging the *shape of the request*. The same edit
+is fine when it is legible and refused when it is not.
+
+### The audit does not police this
+
+`harden-claude.sh` reads `settings.json` to confirm the hook is registered and tightens the file's
+mode. It has never asserted a value for `defaultMode` and still does not, so nothing here will be
+silently reverted on the next timer run. The mode is a preference; the hook and the deny rules are
+the security, and those are what the audit guards.
