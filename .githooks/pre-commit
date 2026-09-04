@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# pre-commit -- refuse any commit that stages a participant session code.
+#
+# The project's hard constraint is that a BL###-style session code never enters
+# a tracked file, a filename, or a commit message. That rule was written down
+# twice and violated twice: once before the first push, and again in the
+# 2026-08-23 bake-off writeup, which reached the PUBLIC remote and had to be
+# scrubbed out of the history on 2026-09-04. A rule an author -- human or
+# assistant -- has to remember is not a control. This is one git enforces.
+#
+# Enabled per clone, once:
+#     git config core.hooksPath .githooks
+# (scripts/save-and-push.sh in the sibling repo does it automatically.)
+#
+# Unlike commit-msg, this one BLOCKS rather than edits. A redaction is a
+# judgement about what the text should say instead, and the hook does not get
+# to make it. Deliberate mention of the pattern goes in as "BL###".
+#
+# Escape hatch, for the rare true positive: git commit --no-verify. If you
+# reach for it, you are asserting the match is not a real participant ID.
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+# Three digits is the shape of a session code. "BL###" is the safe way to
+# write about one and does not match.
+CODE='BL[0-9]{3}'
+fail=0
+
+# 1. Staged filenames. Recording filenames carry the ID directly.
+names="$(git diff --cached --name-only --diff-filter=ACMR | grep -E "$CODE" || true)"
+if [ -n "$names" ]; then
+  echo "pre-commit: BLOCKED -- a staged FILENAME carries a participant code:" >&2
+  printf '  %s\n' $names >&2
+  fail=1
+fi
+
+# 2. Added lines. --cached prints "Binary files ... differ" rather than the
+#    bytes, so a PDF that happens to contain the byte sequence cannot trip it.
+lines="$(git diff --cached --no-color -U0 --diff-filter=ACMR \
+         | grep -E '^\+' | grep -vE '^\+\+\+' | grep -E "$CODE" || true)"
+if [ -n "$lines" ]; then
+  echo "pre-commit: BLOCKED -- a staged LINE carries a participant code:" >&2
+  printf '%s\n' "$lines" | head -20 >&2
+  fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+  cat >&2 <<'NOTE'
+
+Recordings are identifiable PHI and their filenames are the identifier. Write
+the placeholder <stem> for a session, or "BL###" when writing ABOUT the rule.
+Nothing is committed. Fix the staged content and try again.
+NOTE
+  exit 1
+fi
+
+exit 0
