@@ -303,6 +303,29 @@ phrased as a question, since that is what it is.
 
 ---
 
+### The guard stops a read; it does not stop a write
+
+(Added 2026-09-04.) Everything above is about what the assistant may *read*. It says nothing about
+what anybody — assistant or human — may *commit*, and the two failures are not the same shape. The
+PHI guard would not have caught, and did not catch, the actual leak that happened here: a
+participant session code typed into `PSYCH-ASR/README.md` as prose and pushed to a public remote.
+No artifact was read. A string was written.
+
+That rule had been recorded in the project's task list since the beginning and was violated twice
+anyway, the second time by a writeup describing the very run whose filenames carry the identifier.
+So it is now a `pre-commit` hook in `PSYCH-ASR/.githooks/` and `Research-Journey/.githooks/`,
+beside the existing attribution stripper: any staged filename or added line matching the session-code
+shape blocks the commit. Both histories were rewritten with `git-filter-repo` and force-pushed on
+2026-09-04 to remove the code that got out.
+
+Two design points, both the same point the rest of this document makes. **It blocks rather than
+edits**, unlike `commit-msg` beside it, because choosing replacement text is a judgement about
+meaning and a hook does not get to make it. And **it is a control rather than a rule**: the
+previous fix was writing the rule down more emphatically, and it failed identically the second
+time. `--no-verify` remains, and using it is an assertion that the match is not a real identifier.
+
+---
+
 ## 10. Auto mode is the default, and bypass mode is not
 
 Decided 2026-09-03. `permissions.defaultMode` was `acceptEdits` and is now `auto`, set at the
