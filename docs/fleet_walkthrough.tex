@@ -111,65 +111,75 @@ as fast. Worth knowing before anyone promises ten times.}
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{What happens when several people ask at once}
+\begin{frame}{This is the \emph{giant} model's problem}
 
+\keybox{\large You still have to read \textbf{everybody's} notes.\\[0.3em]
+Working together would only avoid slowing anyone down if you all wanted the \textbf{same} notes ---
+and you never do.}
+
+\vspace{0.5em}
 \begin{center}
 \small
-\renewcommand{\arraystretch}{1.35}
-\begin{tabular}{@{}lcc@{}}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}lc@{}}
 \toprule
-& \textbf{your wait for a page} & \\
+\textbf{Asking the giant model} & \textbf{your wait for a page} \\
 \midrule
-you, working alone & about 1 minute & \\
-you, with 3 colleagues also asking & about 2--3 minutes & \\
-\textbf{you, with 7 colleagues also asking} & \textbf{about 5 minutes} & \\
+alone & about 1 minute \\
+with 3 colleagues also asking & about 2--3 minutes \\
+\textbf{with 7 colleagues also asking} & \textbf{about 5 minutes} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.5em}
+{\small Measured, not estimated. The group does get through about \textbf{1.7 times} more work than
+taking turns --- but that small gain is split eight ways while your own answer arrives \textbf{five
+times later}.}
+
+\vspace{0.4em}
+\goodbox{\textbf{So the giant model is a one-at-a-time resource.} It is not the thing a crowd
+should be talking to. \textbf{The next slide is why a smaller model escapes this entirely.}}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{Why a smaller model escapes it --- so: three helpers}
+
+\begin{center}
+\scriptsize
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}p{0.19\textwidth}p{0.33\textwidth}p{0.38\textwidth}@{}}
+\toprule
+& \textbf{the giant model} & \textbf{the everyday helper} \\
+\midrule
+notes kept & in ordinary memory & \textbf{on the graphics cards} \\
+reading them & \textbf{slow} --- this is the bottleneck & almost instant \\
+so the slow part is & \textbf{fetching notes} & \textbf{thinking} \\
+does sharing help? & \textbf{no} --- everyone needs different notes & \textbf{yes} --- one machine can do eight people's thinking at once far more cheaply than eight times over \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \vspace{0.4em}
-\keybox{\small \textbf{Why: eight people need eight \emph{different} specialists.} The model cannot
-answer everyone by reading one set of notes --- it has to read nearly everybody's. Sharing would
-only help if you all wanted the same specialists, and you don't.}
+\keybox{\small \textbf{That is the whole reason for building two.} Fetching cannot be shared;
+thinking can. Make the model small enough that fetching stops being the problem, and a crowd
+suddenly costs almost nothing.}
 
 \vspace{0.4em}
-{\small Handling everyone together \emph{does} help a little: the group gets through about
-\textbf{1.7 times} as much work as taking turns would. But that small gain is spread across eight
-people, while \textbf{your own answer arrives five times later.} Measured, not estimated.}
-
-\vspace{0.3em}
-\goodbox{\small \textbf{The conclusion:} a giant model can serve \emph{one} person well, or a crowd
-badly. For a crowd you need a \textbf{smaller} model --- which is why we build more than one.}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{So: three helpers, not one}
-
 \begin{center}
+\resizebox{0.95\textwidth}{!}{%
 \begin{tikzpicture}[font=\small, >={Stealth[length=2.5mm]}]
-\node[draw=black!40, fill=black!7, rounded corners, minimum width=2.4cm, minimum height=1.3cm,
-      align=center] (u) at (-0.6,0) {\textbf{you}\\(and colleagues)};
-\node[draw=blue!55!black, very thick, fill=blue!12, rounded corners, minimum width=6.4cm,
-      minimum height=1.6cm, align=center] (a) at (5.8,1.3)
-      {\textbf{THE EVERYDAY HELPER}\\quick, clever, \emph{serves everyone at once}};
-\node[draw=green!45!black, very thick, fill=green!14, rounded corners, minimum width=6.4cm,
-      minimum height=1.6cm, align=center] (b) at (5.8,-1.2)
-      {\textbf{THE SPECIALIST}\\the giant model --- slow, deep, \emph{one person at a time}};
-\draw[->, very thick] (u.east) -- node[font=\scriptsize, above, sloped] {you talk to this one} (a.west);
-\draw[->, very thick, green!45!black] (a.south) -- node[font=\scriptsize, right, align=left]
-      {and it asks the\\specialist when\\a question is hard} (b.north);
-\end{tikzpicture}
+\node[draw=black!40, fill=black!7, rounded corners, minimum width=2.4cm, minimum height=1.2cm,
+      align=center] (u) at (0,0) {\textbf{you}};
+\node[draw=blue!55!black, very thick, fill=blue!12, rounded corners, minimum width=5.4cm,
+      minimum height=1.2cm, align=center] (a) at (7.0,0) {\textbf{THE EVERYDAY HELPER}\\\emph{everyone at once}};
+\node[draw=green!45!black, very thick, fill=green!14, rounded corners, minimum width=5.4cm,
+      minimum height=1.2cm, align=center] (b) at (15.4,0) {\textbf{THE SPECIALIST}\\\emph{one at a time}};
+\draw[->, very thick] (u) -- node[font=\scriptsize, above] {you talk to} (a);
+\draw[->, very thick, green!45!black] (a) -- node[font=\scriptsize, above] {it consults} (b);
+\end{tikzpicture}}
 \end{center}
-
-\vspace{0.4em}
-\keybox{\small \textbf{Like a good office.} You talk to the capable colleague who is always there.
-When something genuinely difficult comes up, \emph{they} ask the world expert down the hall and come
-back with the answer.}
-
-\vspace{0.3em}
-{\small A \textbf{third} helper runs overnight, grinding through big piles of paperwork --- scoring
-thousands of transcripts. Nobody talks to it.}
 
 \end{frame}
 
