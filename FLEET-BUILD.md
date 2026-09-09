@@ -282,9 +282,49 @@ The mitigation is the two-plane split `DESIGN.md` §5.4 recommends and it should
 start: **tier 3 (PHI corpus work) stays on the filesystem queue with no socket at all**, and tier 1
 is the conversational plane. One router serving both is how they get confused.
 
-`COLI_API_KEY` and `KVSAVE=0` are mandatory on tier 2. colibrì persists conversation KV to a
-dot-file **inside the model directory** by default — roughly 182 KB per token of PHI-derived state
-on a shared filesystem.
+`KVSAVE=0` is mandatory on tier 2: colibrì persists conversation KV to a dot-file **inside the
+model directory** by default — roughly 182 KB per token of PHI-derived state on a shared filesystem.
+
+### 6.1 The two "API keys", only one of which is real
+
+These get confused, and the confusing one has Anthropic's name on it.
+
+**`ANTHROPIC_API_KEY` is a dummy string and has nothing to do with Anthropic.** It is not an
+Anthropic account, it is not billed, and it never leaves the machine. Claude Code and the Anthropic
+SDKs refuse to start with the variable empty, so colibrì's docs say to set it to any non-empty word:
+*"the `api_key: local` dummy is what satisfies clients that demand a key"* and *"only enforced if
+you set `COLI_API_KEY`."* `ANTHROPIC_BASE_URL` is what actually decides where requests go; point it
+at our server and no model call reaches Anthropic. **Write it as `ANTHROPIC_API_KEY=local` in every
+document and script**, never as a placeholder that looks like a credential, or somebody will
+eventually go looking for one.
+
+**`COLI_API_KEY` is ours, we choose it, and colibrì enforces it.** Three reasons it is not optional:
+
+1. **A shared node has no network isolation.** `README.md` §7.20, already recorded as a *live* gap:
+   Slurm gives a job no network namespace, so any user with a shell on that node can connect to a
+   loopback port on it. Today the only thing between another account and our endpoint is that they
+   have no reason to look.
+2. **Tier 1 binds the cluster interface, not loopback** (§6), because a loopback bind serves one
+   node and defeats the point. Reachable from six nodes with no key means every account on the
+   cluster can spend our GPUs and our fair-share, and submit prompts we are answerable for.
+3. **colibrì's KV slots are selected by number and are not user-isolated.** A request may carry
+   `cache_slot: N`; the engine then matches that prompt against **slot N's stored history** and
+   reuses the common prefix. Two people who pick the same number do not get two conversations —
+   they get one, corrupted, with a plausible path to reading each other's context. The key is what
+   keeps strangers out of the slot table.
+
+`DESIGN.md` §9 named "does this engine support an API key" as a selection criterion precisely
+because ollama has none. colibrì having one **closes** a recorded gap rather than opening a new
+requirement.
+
+### 6.2 The key does not make the client local
+
+Pointing `ANTHROPIC_BASE_URL` at our server routes **model calls** locally. It does not make the
+client itself offline. `DESIGN.md` §9 states the rule and it survives this revision unchanged: the
+harness is a separate egress surface from the model. Telemetry, error reporting, auto-update and
+web tools are independent traffic, and a fetched page still arrives as text the model cannot
+distinguish from instructions. **Any client adopted here gets the same default-deny audit opencode
+got, and that audit is part of adopting it, not a follow-up.**
 
 ---
 
@@ -367,7 +407,7 @@ as current state. Never sample during a cold start.
 Starting configuration, to be replaced by `coli tune`: `CUDA_DENSE=1`, `RAM_GB≈450`, `PIN=stats`
 with a large `PIN_GB`, `XEXP=1` (measure), `DIRECT=1 PIPE=1`, **`URING` and `PILOT*` off** (+26 %
 once resident — they only burn the scarce CPU), `CTX=131072`, `COLI_PREFILL_CHUNK=2048`,
-`KVSAVE=0`, `COLI_API_KEY` set, `COLI_USAGE_DECAY` on, `KV_SLOTS=1` with `DRAFT` measured.
+`KVSAVE=0`, `COLI_API_KEY` set (§6.1), `COLI_USAGE_DECAY` on, `KV_SLOTS=1` with `DRAFT` measured.
 
 ---
 
