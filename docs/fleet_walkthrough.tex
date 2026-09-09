@@ -58,102 +58,88 @@ is not allowed to go.}
 %----------------------------------------------------------
 \begin{frame}{First, the one idea everything else depends on}
 
-An AI model is basically a gigantic pile of numbers. Ours would be a very big pile: \textbf{744
-billion of them}. Far too big to keep somewhere fast and convenient.
+\keybox{\textbf{The model is not one brain. It is about 19,000 narrow specialists.}\\[0.3em]
+One knows about Python. One knows about Italian grammar. One knows about chemistry names. Nobody
+knows everything.}
 
 \vspace{0.5em}
-\keybox{\textbf{Think of it as a library.} The model is a library with about \textbf{19,000 books}.
-To produce even one word of an answer, it does not read the whole library --- it fetches a small
-handful of books, reads them, and puts them back.}
+{\small To write each word, the model picks the handful of specialists that word needs and
+\textbf{reads their notes}. Reading the notes is the work; everything else is quick. So the design
+question is: \emph{where do we keep 19,000 sets of notes?}}
 
-\vspace{0.5em}
 \begin{center}
 \begin{tikzpicture}[font=\small]
-\node[draw=green!45!black, thick, fill=green!14, rounded corners, minimum width=3.1cm,
-      minimum height=1.5cm, align=center] (a) at (0,0) {\textbf{On the desk}\\tiny, instant};
-\node[draw=blue!55!black, thick, fill=blue!12, rounded corners, minimum width=3.1cm,
-      minimum height=1.5cm, align=center] (b) at (4.2,0) {\textbf{On the shelves}\\big, quick};
-\node[draw=black!45, fill=black!6, rounded corners, minimum width=3.1cm,
-      minimum height=1.5cm, align=center] (c) at (8.4,0) {\textbf{In the basement}\\huge, slow};
-\node[font=\scriptsize, text=black!60, below=2pt of a] {a few books};
-\node[font=\scriptsize, text=black!60, below=2pt of b] {\textbf{all 19,000 fit here}};
+\node[draw=green!45!black, thick, fill=green!14, rounded corners, minimum width=3.4cm,
+      minimum height=1.4cm, align=center] (a) at (0,0) {\textbf{instant}\\graphics card};
+\node[draw=blue!55!black, thick, fill=blue!12, rounded corners, minimum width=3.4cm,
+      minimum height=1.4cm, align=center] (b) at (4.4,0) {\textbf{fast}\\main memory};
+\node[draw=black!45, fill=black!6, rounded corners, minimum width=3.4cm,
+      minimum height=1.4cm, align=center] (c) at (8.8,0) {\textbf{very slow}\\shared storage};
+\node[font=\scriptsize, text=black!60, below=2pt of a] {only a few fit};
+\node[font=\scriptsize, text=black!60, below=2pt of b] {\textbf{all 19,000 fit}};
 \node[font=\scriptsize, text=black!60, below=2pt of c] {we avoid this};
 \end{tikzpicture}
 \end{center}
 
-\vspace{0.5em}
-\goodbox{\small \textbf{Good news, and the reason this project is possible at all:} our computers
-have enough shelf space for \emph{the entire library}. The assistant never goes to the basement
-while answering you.}
+\vspace{0.4em}
+\goodbox{\small \textbf{The reason this project is possible at all:} our machines have enough main
+memory to hold \emph{every one} of the 19,000 sets of notes. The assistant never has to go to slow
+storage while it is answering you.}
 
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{Why it is slow: 600 books to carry, per word}
+\begin{frame}{Why it is slow: 600 specialists consulted, per word}
 
-Here is the whole speed problem, and there is no trick that makes it go away.
-
-\vspace{0.6em}
-\begin{center}
-\begin{tikzpicture}[font=\small, >={Stealth[length=2.5mm]}]
-\node[draw=black!40, fill=black!5, rounded corners, minimum width=2.4cm, minimum height=1.1cm,
-      align=center] (w) at (0,0) {\textbf{one word}};
-\node[draw=blue!55!black, thick, fill=blue!12, rounded corners, minimum width=3.4cm,
-      minimum height=1.1cm, align=center] (l) at (4.6,0) {\textbf{75 floors}\\to walk};
-\node[draw=blue!55!black, thick, fill=blue!12, rounded corners, minimum width=3.4cm,
-      minimum height=1.1cm, align=center] (b) at (9.6,0) {\textbf{8 books}\\on each floor};
-\draw[->, thick] (w) -- (l);
-\draw[->, thick] (l) -- (b);
-\end{tikzpicture}
-\end{center}
+Writing one word is not one lookup. The model works through the question in \textbf{75 rounds}, and
+in each round it consults \textbf{8} specialists.
 
 \vspace{0.6em}
-\keybox{\Large 75 floors $\times$ 8 books = \textbf{600 books to carry, for every single word.}}
+\keybox{\Large 75 rounds $\times$ 8 specialists = \textbf{600 sets of notes read,\\for every single
+word.}}
+
+\vspace{0.8em}
+That is the entire speed problem, and no clever engineering removes it. \textbf{Reading notes is the
+work.} We can keep the notes somewhere faster --- that is what the previous slide was about --- but
+we cannot read fewer of them.
 
 \vspace{0.7em}
-\textbf{The cost is the carrying, not the walking.} The books are heavy and there are 600 of them
-per word. Shortening the walk barely helps. \textbf{Remember this} --- it is the reason the obvious
-speed-up on the next slide does not work.
-
-\vspace{0.6em}
-{\small And the carrying is only \emph{half} the work. The other half is the thinking it does once
-it has the books. Even if carrying were instant we would only be about \textbf{twice} as fast.
-Worth knowing before anyone promises ten times.}
+{\small And reading is only \emph{half} the job. The other half is the thinking the model does once
+it has the notes in front of it. So even if reading were free, we would only be about \textbf{twice}
+as fast. Worth knowing before anyone promises ten times.}
 
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{The obvious fix that does not work}
+\begin{frame}{What happens when several people ask at once}
 
-{\small \textbf{The obvious idea:} eight people ask at once, so make \emph{one} trip instead of
-eight. Eight people for the price of one.}
-
-\keybox{\small \textbf{The catch: eight people want eight \emph{different} sets of books.} You still
-carry almost all of them. You saved the walking --- and the walking was never the cost.}
-
-\vspace{0.4em}
 \begin{center}
-\scriptsize
-\begin{tabular}{@{}lrrr@{}}
+\small
+\renewcommand{\arraystretch}{1.35}
+\begin{tabular}{@{}lcc@{}}
 \toprule
-& \textbf{trips} & \textbf{books carried} & \textbf{books \emph{per person}} \\
+& \textbf{your wait for a page} & \\
 \midrule
-one person, alone & 1 & 8 & \textbf{8.0} \\
-eight people, one after another & 8 & \textbf{64} & \textbf{8.0} \\
-\textbf{eight people, all in one trip} & \textbf{1} & \textbf{57} & \textbf{7.2} \\
+you, working alone & about 1 minute & \\
+you, with 3 colleagues also asking & about 2--3 minutes & \\
+\textbf{you, with 7 colleagues also asking} & \textbf{about 5 minutes} & \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \vspace{0.4em}
-{\small You hoped the cost per person would fall from 8 books to 1. \textbf{It falls from 8.0 to
-7.2} --- a few people want the same book, but with 19,000 to choose from, only a few.
-\textbf{Measured, not guessed:} eight at once did about \textbf{1.7$\times$} the work in total, and
-each waited about \textbf{five times longer} for their own answer.}
+\keybox{\small \textbf{Why: eight people need eight \emph{different} specialists.} The model cannot
+answer everyone by reading one set of notes --- it has to read nearly everybody's. Sharing would
+only help if you all wanted the same specialists, and you don't.}
 
-\vspace{0.2em}
-\goodbox{\small \textbf{The conclusion:} a giant model cannot serve a crowd quickly. For a crowd you
-need a \textbf{smaller} model --- which is why we build more than one.}
+\vspace{0.4em}
+{\small Handling everyone together \emph{does} help a little: the group gets through about
+\textbf{1.7 times} as much work as taking turns would. But that small gain is spread across eight
+people, while \textbf{your own answer arrives five times later.} Measured, not estimated.}
+
+\vspace{0.3em}
+\goodbox{\small \textbf{The conclusion:} a giant model can serve \emph{one} person well, or a crowd
+badly. For a crowd you need a \textbf{smaller} model --- which is why we build more than one.}
 
 \end{frame}
 
