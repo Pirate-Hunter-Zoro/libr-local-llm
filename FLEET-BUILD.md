@@ -118,9 +118,26 @@ B = 16  →  99.5           (12.4× the bytes, 16 tokens)
 **The union grows almost linearly with the batch.** Expert bytes per token barely fall, so the 43 %
 half of the budget does not amortise. Only the 57 % half does.
 
-Working it through at `KV_SLOTS=8`: expert phase 57.4 experts → 86 GB → 652 ms; everything else
-~150 ms; total ~800 ms for 8 tokens. That is **10 tok/s aggregate and 1.25 tok/s each** — better
-in total than 4.68, far worse for the person waiting.
+Working it through at `KV_SLOTS=8` predicts ~10 tok/s aggregate and ~1.25 tok/s each. **colibrì
+ran that experiment under full residency and the prediction holds**
+(`docs/experiments/glm52-continuous-batching-2026-07-31.md`, 6× RTX 5090, zero disk reads):
+
+| active sessions | aggregate tok/s | **per session** |
+|---:|---:|---:|
+| 1 | 4.84 | **4.84** |
+| 2 | 6.33 | 3.16 |
+| 4 | 8.14 | 2.04 |
+| 8 | **8.30** | **1.04** |
+
+Aggregate saturates at ~8.3 by four sessions — *below* that host's own 8.90 tok/s single-stream
+baseline. Their verdict: *"the present CPU+GPU execution path does not increase aggregate GLM-5.2
+decode throughput beyond the existing single-stream ceiling."* Eight-session p95 time-between-tokens
+was 1.3 s.
+
+Part of that is an implementation limit they name — the multi-row int4 CPU kernel *"loses roughly
+half of the effective RAM bandwidth"*, and a fix is planned. **The union caps what that fix can
+return:** at B=8 the union is 57.4 of a possible 64 expert-selections, so a perfect kernel saves
+about 10 % of the bytes, not a multiple.
 
 Speculation is the same shape. MTP with depth 4 verifies ≤5 tokens for 4.7× the expert bytes; at a
 70 % acceptance rate it returns roughly **1.35×**. colibrì's own note that MTP *"measured a 32 %
@@ -353,7 +370,97 @@ once resident — they only burn the scarce CPU), `CTX=131072`, `COLI_PREFILL_CH
 
 ---
 
-## 11. Decisions that are yours
+## 11. How good will the answers be, and how do we know when a question is hard
+
+Two questions that decide whether any of this is worth building, and neither has a clean answer.
+They are here rather than in a footnote because the escalation design in §4 depends on them.
+
+### 11.1 What the quality evidence actually says
+
+Earlier revisions of this file quoted **"−8.2 pp"** as GLM-5.2's int4 quantization cost. That is
+wrong twice over, and the correction runs in colibrì's favour:
+
+- The −8.2 pp was measured on **OLMoE**, fp16 against int4, under the same harness. It is a proxy
+  for the *mechanism*, not a GLM measurement.
+- It was measured with **per-row** int4 scales. colibrì reports **grouped scales recover ~63 % of
+  that loss**, and our container is `int4-g64` — grouped. Honest estimate: nearer **−3 pp**.
+
+The mechanism is worth keeping in mind because of *where* it lands: per-row int4 scales erode the
+small logit margins that hard questions depend on, so **quantization damage concentrates on exactly
+the questions you would escalate for.**
+
+The one direct number is **62.5 % mean `acc_norm`** on hellaswag/arc/mmlu, 0-shot log-likelihood,
+**n=40** — and colibrì says plainly that 0-shot multiple choice underserves a reasoning model at
+that sample size. Treat it as evidence that a measurement exists, not as the model's quality.
+
+**Nobody can tell you how good tier 1 will be from a document.** What can be said is the shape:
+mechanical work — running commands, reading output, iterating on a compile error, writing prose to a
+house style, single-step tool use — is where open models are closest to hosted ones. The gap opens
+on four things, in order of severity:
+
+1. **Long-context synthesis.** Holding thousands of lines from several files at once and noticing
+   that two of them contradict each other. This repo already documents the failure mode as
+   `README.md` §7.24: a 55K-token session against a 65,536 window began returning empty turns
+   because the prompt was truncated from the front, where the tool definitions live. **Nominal
+   context is not usable context**, and prefill at 148–198 tok/s means a 100K-token context costs
+   ~10 minutes before the first output token.
+2. **Deciding what to look for.** Grepping a 12,000-line C file for `tok/s` because a project
+   written that way probably puts measurements in code comments is a hunch, not a procedure.
+3. **Noticing an absence.** That every pending job on the cluster was `BeginTime` mattered because
+   it invalidated a design about to be written. Nothing prompts for that.
+4. **Holding a position under pushback** — going back and finding a real error rather than
+   producing a better-sounding answer. This is the one that degrades first and hurts most.
+
+### 11.2 The escalation problem, and what not to build
+
+**Do not ask the model whether the question is hard.** Confidence calibration is poor in LLMs and
+worse at int4, and a model that does not know what it does not know is precisely the failure this
+would need to detect. `DESIGN.md` §5.5 already refuses automatic quality cascade — *"escalation is
+explicit: a human or an agent names the big model. Do not build the clever version."* That still
+stands, and §11.1 is the reason.
+
+Four mechanisms that do work, in order of reliability:
+
+| mechanism | trigger | cost |
+|---|---|---|
+| **the human escalates** | you type `fleet ask` | you must know you are stuck; usually you do |
+| **observable loop signals** | tool calls past N, same file edited 3+ times, a test failing twice, self-contradiction across turns | crude, but the harness can see these **without asking the model** |
+| **task-shape declaration** | "design", "decide between", "why is this slow", "review this before it lands" — categories named up front | needs discipline, not intelligence |
+| **second opinion on write** | any artifact that outlives the session — a design doc, a schema, a migration — gets one tier-2 pass before it lands | a minute per document; cheap |
+
+The second row is the one worth engineering, because it needs no introspection. A loop that has
+edited the same file four times is stuck whether or not it believes it is.
+
+### 11.3 The acceptance test: this session, as the benchmark
+
+The sessions that produced this file are the right eval, because their answers are now known and
+they are on our data rather than someone else's.
+
+**Ground truth — three findings, each independently checkable:**
+
+| # | finding | how it was reached |
+|---|---|---|
+| 1 | `c3` can `SIGSTOP` a server silently: tier 20 vs tier 10, `PreemptMode=SUSPEND`, same six nodes — and suspend does not free VRAM | connect three command outputs plus outside knowledge |
+| 2 | A 1-CPU ask bills 2 (`CR_CORE_MEMORY`, 2 threads/core), and `MaxMemPerCPU=12000` means memory silently buys CPUs | read one `AllocTRES` line and know why |
+| 3 | The expert **union** grows almost linearly with batch size, so neither batching nor speculation amortises the dominant cost | derive it, having decided a cited measurement was not enough |
+
+**Protocol.** Give the system this repository at commit `34457a7` (before any of this planning
+existed) and the original prompt. Score: which findings appear, unprompted; how many false findings
+it asserts with confidence; whether it holds a correct position when told it is wrong.
+
+**The last column is the one to weight.** Two of these three were wrong in an earlier revision and
+were only corrected under pushback. A system that capitulates and invents a better-sounding answer
+scores worse than one that never found the issue.
+
+**Expected outcome, stated in advance so the test can falsify it:** tier 1 handles the great
+majority of the mechanical work — the shell probing, the LaTeX, the document drafting — and is
+unlikely to produce findings 1 and 3 unprompted. That is not a reason to skip building it. **A
+system that does the routine 90 % and leaves your attention for the 10 % that is judgement is worth
+having**; it is a fast assistant that needs supervision, not a replacement for one.
+
+---
+
+## 12. Decisions that are yours
 
 1. **Does tier 1 bind the cluster network?** It must, to serve more than one node. That is an
    explicit weakening of the loopback control (§6). Tier 3 stays socket-free regardless.
@@ -363,14 +470,13 @@ once resident — they only burn the scarce CPU), `CTX=131072`, `COLI_PREFILL_CH
 4. **Claude Code everywhere, or opencode for tier 1?** colibrì speaks Anthropic natively; vLLM does
    not. Either write a thin adapter or accept two clients.
 5. **If tier 1 measures well, is tier 2 still worth 372 GB and a node?** Ask it again after test 9.
-   A good 235B at int4 may make the 744B a luxury — and GLM-5.2's int4 container carries a measured
-   **−8.2 percentage point** quantization cost, so the quality gap is smaller than the parameter
-   counts suggest. **A blind side-by-side on real tasks from our own repos is owed** before tier 2
-   is built.
+   A good 235B at int4 may make the 744B a luxury. **A blind side-by-side on real tasks from our own
+   repos is owed** before tier 2 is built — see §11.1 for what the quality evidence actually says, and
+   what it does not.
 
 ---
 
-## 12. Carried forward unchanged
+## 13. Carried forward unchanged
 
 - `c3` can `SIGSTOP` a server and the client sees silence, not an error: `c3_short` is
   `PriorityTier=20`, `c3` is 10 with `PreemptMode=SUSPEND`, same six nodes. **Inferred from

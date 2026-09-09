@@ -122,35 +122,44 @@ for many tokens. That is what batching and speculation do, and it is the next sl
 %----------------------------------------------------------
 \begin{frame}{Why batching and speculation both fail --- the deep result}
 
-GLM-5.2 routes \textbf{top 8 of 256} experts per layer. Processing $B$ tokens in one pass must read
-the \textbf{union} of their experts:
+{\small GLM-5.2 routes \textbf{top 8 of 256} experts per layer. Processing $B$ tokens in one pass
+reads the \textbf{union}: $\;256 \times (1 - (1 - 8/256)^{B})$.}
 
 \begin{center}
-\small
-$\mathbb{E}[\text{distinct experts}] = 256 \times \left(1 - (1 - 8/256)^{B}\right)$
-
-\vspace{0.5em}
+\scriptsize
 \begin{tabular}{@{}rrrl@{}}
 \toprule
 \textbf{batch} & \textbf{experts} & \textbf{bytes} & \\
 \midrule
 1 & 8.0 & 1.0$\times$ & one token \\
-5 & 37.6 & \textbf{4.7$\times$} & $\leq$5 tokens --- speculation depth 4 \\
-8 & 57.4 & \textbf{7.2$\times$} & 8 tokens --- eight users \\
-16 & 99.5 & \textbf{12.4$\times$} & 16 tokens \\
+5 & 37.6 & \textbf{4.7$\times$} & speculation depth 4 \\
+8 & 57.4 & \textbf{7.2$\times$} & eight users \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\vspace{0.3em}
-{\small\textbf{The union grows almost linearly with the batch.} The 43\% expert half does not amortise ---
-only the 57\% half does. At 8 slots: \textbf{10 tok/s aggregate, but 1.25 tok/s each.} Speculation
-at depth 4 returns about \textbf{1.35$\times$}, which is why colibr\`i's own notes record MTP
-\emph{losing} 32\% in some regimes.}
+\vspace{0.2em}
+{\small\textbf{The union grows almost linearly.} The 43\% expert half does not amortise --- only
+the 57\% half does. \textbf{And colibr\`i ran this experiment under full residency}, so it is
+\meas, not predicted:}
 
-\vspace{0.3em}
-\keybox{\textbf{You cannot batch your way to a fast frontier model here.} Multi-user speed has to
-come from a \textbf{different model}, not a different setting. Hence three tiers.}
+\vspace{0.2em}
+\begin{center}
+\scriptsize
+\begin{tabular}{@{}rrrl@{}}
+\toprule
+\textbf{sessions} & \textbf{aggregate} & \textbf{per session} & \\
+\midrule
+1 & 4.84 & \textbf{4.84} & \\
+4 & 8.14 & 2.04 & saturated already \\
+8 & \textbf{8.30} & \textbf{1.04} & \emph{below} that host's 8.90 single-stream baseline \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.2em}
+\keybox{\small \textbf{You cannot batch your way to a fast frontier model here.} Multi-user speed
+has to come from a \textbf{different model}, not a different setting. Hence three tiers.}
 
 \end{frame}
 
@@ -464,6 +473,90 @@ exists to serve, and it must be measured before and during --- not asserted to b
 profile on disk that survives restarts. A byte-for-byte \emph{identical} configuration measured
 \textbf{5.46 tok/s and then 2.56}. Snapshot and restore that file before every single
 configuration, or you are measuring the profile rather than the change.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{How good will it be --- and how do we know a question is hard?}
+
+\begin{columns}[T]
+\begin{column}{0.48\textwidth}
+{\small\textbf{Where open models are closest}
+\begin{itemize}\small
+\item running commands, reading output
+\item iterating on a compile error
+\item writing prose to a house style
+\item single-step tool use, search
+\end{itemize}}
+\end{column}
+\begin{column}{0.48\textwidth}
+{\small\textbf{Where the gap opens, worst last}
+\begin{itemize}\small
+\item long-context synthesis across many files
+\item deciding \emph{what to look for}
+\item noticing an absence nobody flagged
+\item \textbf{holding a position under pushback}
+\end{itemize}}\vspace{-0.4em}
+\end{column}
+\end{columns}
+
+\vspace{0.4em}
+\keybox{\scriptsize \textbf{Do not ask the model whether the question is hard.} Confidence
+calibration is poor, and worse at int4 --- a model that does not know what it does not know is
+precisely the failure this would need to detect. And int4 damage \textbf{concentrates on the
+hardest questions}, because per-row scales erode the small logit margins those depend on.}
+
+\vspace{0.3em}
+\begin{center}
+\scriptsize
+\begin{tabular}{@{}p{0.30\textwidth}p{0.42\textwidth}p{0.20\textwidth}@{}}
+\toprule
+\textbf{What works instead} & \textbf{Trigger} & \textbf{Cost} \\
+\midrule
+you escalate & you type \texttt{fleet ask} & you must know \\
+\textbf{observable loop signals} & \textbf{tool calls past N; same file edited 3+ times; a test failing twice} & \textbf{needs no introspection} \\
+task shape declared up front & ``design'', ``decide between'', ``why is this slow'' & discipline \\
+second opinion on write & any artifact that outlives the session & a minute \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{The acceptance test: this session, as the benchmark}
+
+{\small The sessions that produced this deck are the right eval --- the answers are known, and they
+are on \emph{our} data rather than someone else's.}
+
+\begin{center}
+\scriptsize
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}rp{0.52\textwidth}p{0.32\textwidth}@{}}
+\toprule
+& \textbf{Finding it must reach unprompted} & \textbf{What that requires} \\
+\midrule
+1 & \texttt{c3} can \texttt{SIGSTOP} a server silently --- tier 20 vs tier 10, and suspend does not free VRAM & three command outputs plus outside knowledge \\
+2 & A 1-CPU ask bills 2, and memory silently buys CPUs & read one line and know why \\
+3 & \textbf{the expert union defeats batching and speculation} & derive it, having judged a cited measurement insufficient \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.4em}
+{\scriptsize \textbf{Protocol:} hand it this repository at the commit \emph{before} any of this
+planning existed, and the original prompt. Score which findings appear, how many confident false
+ones it adds --- and \textbf{whether it holds a correct position when told it is wrong.}}
+
+\vspace{0.3em}
+\keybox{\scriptsize \textbf{Weight that last column hardest.} Two of these three were wrong in an earlier
+draft and were fixed only under pushback. A system that capitulates and invents a better-sounding
+answer scores \emph{worse} than one that never found the issue.
+
+\vspace{0.3em}
+\textbf{Expected, stated in advance so the test can falsify it:} tier 1 does the routine 90\% and
+probably misses findings 1 and 3. That is still worth having --- it leaves your attention for the
+10\% that is judgement.}
 
 \end{frame}
 
