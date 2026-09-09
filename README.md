@@ -29,12 +29,15 @@ appears, it uses this too.
 > must not be read as one document. Durable facts graduate from `DESIGN.md` into here when a piece
 > is built and verified. (Added 2026-08-22.)
 
-> **Where the next phase is scheduled.** [`FLEET-BUILD.md`](FLEET-BUILD.md) is the build runbook for
-> that design: the feasibility verdict, the phases with their exit criteria, the eight preflight
-> tests, and the four live-cluster findings that changed three of `DESIGN.md`'s assumptions. Still
-> nothing built — this is the work order, not a record of work. A 16-slide plain-language
-> walkthrough of the same system is [`docs/fleet_walkthrough.pdf`](docs/fleet_walkthrough.pdf)
-> (source `docs/fleet_walkthrough.tex`, built with `pdflatex`). (Added 2026-09-09.)
+> **Where the next phase is scheduled.** [`FLEET-BUILD.md`](FLEET-BUILD.md) is the build runbook.
+> **Revised 2026-09-09 (second pass): the service is now built around colibrì, not ollama.** The
+> ollama models are judged inadequate in reasoning quality for the work this is for, so the plan
+> centres on GLM-5.2 (744B, int4, 372 GB) on one node — one GPU, ~500 GB of RAM, ~6–12 tok/s — with
+> vLLM keeping a narrowed batch-only role and no router between them. The runbook carries the
+> performance arithmetic, the placement argument, the mandatory tuning protocol, the ten preflight
+> tests, and the five decisions that are the user's. Still nothing built. An 18-slide plain-language
+> walkthrough is [`docs/fleet_walkthrough.pdf`](docs/fleet_walkthrough.pdf) (source
+> `docs/fleet_walkthrough.tex`, built with `pdflatex`).
 
 > **How the assistant is fenced in.** [`PERMISSIONS.md`](PERMISSIONS.md) is the architecture record
 > for Claude Code's permission configuration on this account: which commands skip the prompt, which
@@ -712,10 +715,13 @@ Do not re-learn these.
   two data planes, the yield ladder, the citizenship rules, milestones with exit criteria, the
   measurements we owe ourselves, and the traps anticipated but not yet paid for — is
   [`DESIGN.md`](DESIGN.md). Read that before writing any of it — and then
-  [`FLEET-BUILD.md`](FLEET-BUILD.md), added 2026-09-09, which turns it into an ordered build with
-  exit criteria, records the four live-cluster findings that revised it, and lists the five
-  decisions that are the user's to make before any of it starts. Three things from `DESIGN.md` that
-  change how the items below should be read:
+  [`FLEET-BUILD.md`](FLEET-BUILD.md), which turns it into an ordered build with exit criteria and
+  **supersedes its engine choice**: the service is now colibrì-first, ollama is dropped from the
+  plan, and vLLM is narrowed to batch corpus work only. The two most consequential revisions there:
+  a node's **1 TB of RAM holds the whole 372 GB model**, which makes the four-GPU node worth under
+  2 % and removes the reason to hold compute306; and the **27-minute cold start**, not the GPU, is
+  what constrains the design. Three things from `DESIGN.md` that change how the items below should
+  be read:
   - **Replicas, not shards.** With NVLink inactive (§1), independent single-GPU replicas beat
     tensor parallelism for any model that fits on one card — more aggregate throughput, and a replica
     can be surrendered one at a time where a 4-GPU job cannot. This supersedes the tensor-parallel

@@ -1,624 +1,481 @@
-# FLEET-BUILD.md — the build runbook for the fleet
+# FLEET-BUILD.md — the build runbook for a colibrì-centred inference service
 
-**Point a fresh session at this file.** It is the implementation plan for the service designed in
-[`DESIGN.md`](DESIGN.md): an always-available local inference endpoint that acquires cluster
-resources when they are free, gives them back when somebody else needs them, restarts itself when
-it dies, and is reachable from an opencode TUI on any node.
+**Point a fresh session at this file.** It is the implementation plan for a local inference service
+built around **colibrì** running a frontier MoE model on LIBR compute: acquired when free, given
+back when somebody else needs it, restarted when it dies, and reachable from a terminal client on
+any node.
 
-**A 16-slide walkthrough of the same system, for humans rather than implementers, is
-[`docs/fleet_walkthrough.pdf`](docs/fleet_walkthrough.pdf)** (source `docs/fleet_walkthrough.tex`,
-built with `pdflatex`). Read it first if you want the shape before the detail.
+**Revised 2026-09-09, second pass.** The first pass planned a three-engine fleet with ollama as the
+daily driver. That is withdrawn. ollama's models (`qwen3-coder:30b`, `gpt-oss:120b`) are judged
+inadequate in quality and reasoning for the work this is for, so the service is now built around
+colibrì, which is the only engine here that can run a frontier-scale model at all. vLLM survives
+with a narrowed, non-overlapping job (§8). Everything about the supervisor, the restart chain, and
+the kill switch is unchanged and is still §5.
 
-Read in this order before writing a line: [`AI_INSTRUCTIONS.md`](AI_INSTRUCTIONS.md) (the operating
-contract), [`README.md`](README.md) (what exists), [`DESIGN.md`](DESIGN.md) (why the fleet is
-shaped this way), then this file (what to build, in what order, and how each piece is proven).
+Read in this order before writing a line: [`AI_INSTRUCTIONS.md`](AI_INSTRUCTIONS.md),
+[`README.md`](README.md), [`DESIGN.md`](DESIGN.md), then this file. A 16-slide plain-language
+walkthrough is [`docs/fleet_walkthrough.pdf`](docs/fleet_walkthrough.pdf) (source
+`docs/fleet_walkthrough.tex`).
 
-`DESIGN.md` is the argument. This is the work order. Where they disagree, this file wins and says
-why — three of its assumptions did not survive contact with the live cluster, and §2 lists them.
-
-**No sudo, anywhere, at any step.** Same constraint as everything else in this repo.
-
-(Written 2026-09-09. Cluster facts in §2 were read off the live scheduler that day.)
-
----
-
-## 1. The verdict, before anything else
-
-**Buildable and shippable: yes.** Every mechanism the service needs exists in user space on this
-cluster. Nothing in the plan requires an admin, a daemon on a login node, cron, or a privileged
-port. The riskiest component is the cross-node front door (§7), and there is a working fallback
-for it that ships on day one.
-
-**"Claude Fable caliber": no. Not on this hardware, not with these weights, not at any speed.**
-That has to be said once, plainly, because every design decision below follows from it.
-
-Here is the honest model menu, and it is the whole menu:
-
-| tier | model | resident | where it fits | speed | what it actually is |
-|---|---|---|---|---|---|
-| fast | `qwen3-coder:30b` | 18.6 GB | any one A40, six candidate nodes | ~40–60 tok/s *(projected)* | a competent mid-tier coding assistant |
-| big | `gpt-oss:120b` | 70 GB | **4× A40, compute306 only** | **34.1 tok/s** *(measured, `README.md` §4)* | the strongest thing we can serve interactively |
-| huge | GLM-5.2 744B int4 via colibrì | 429 GB on disk, ~500 GB RAM | 1 A40 + most of a node's RAM | high single digits *(projected)* | frontier-scale weights, at typing-is-faster speed |
-
-None of those is Fable. The gap is not a serving problem that better plumbing closes — it is the
-weights. `gpt-oss:120b` is the ceiling for interactive work here, it is roughly a good open
-120B-class coder, and it requires the cluster's only four-GPU node, which is exactly the resource
-`DESIGN.md` §4.3 says never to hold.
-
-So the service this plan ships is **not** a local Fable. It is:
-
-> An endpoint that is always there, always polite, always reachable from a TUI, serving the best
-> model that currently fits the resources nobody else wants — with an explicit escalation path to
-> the big model when compute306 is free, and to the huge model as a consultant that answers one
-> hard question at a time.
-
-That is genuinely worth having, it is the thing PSYCH-ASR needs (a frontier-ish model that may
-read PHI, which no hosted service will ever be allowed to do here — `DESIGN.md` §11), and it is
-achievable in the phases below. Do not let anyone, including the user, describe it as the other
-thing.
-
-**The structural use of the big models is as consultants, not loop drivers** (`DESIGN.md` §11).
-An agent loop makes dozens of tool calls; at 8 tok/s that is unusable, and at 34 tok/s on a node
-we should not be holding it is antisocial. The loop runs on the fast model. The big model gets
-asked one question and answers it. Build for that shape.
+**No sudo, anywhere, at any step.**
 
 ---
 
-## 2. What changed since `DESIGN.md` was written
+## 1. The verdict
 
-Four findings from the live cluster on 2026-09-09. Each one invalidates or sharpens something in
-the design. Verify each again at the start of P0 — a scheduler config can change under you — but
-plan as though they hold.
+**Buildable: yes. And the pivot to colibrì is better supported by the evidence than the plan it
+replaces** — this hardware is unusually well matched to how colibrì works, for a reason nobody had
+noticed: **1 TB of RAM per node.**
 
-### 2.1 The `c3` partition can silently freeze our server. Never use it for a backend.
+**The speed is 4–8 tok/s and that is a measurement, not a fear.** It does not get better with more
+GPUs. §3 is the arithmetic and §3.4 is where the evidence comes from.
 
-`scontrol show config` reports `PreemptType=preempt/partition_prio`, `PreemptMode=GANG,SUSPEND`.
-The partitions carry different priority tiers:
+Three consequences, stated up front because everything below follows from them:
 
-| partition | PriorityTier | PreemptMode | OverSubscribe |
+1. **This is a consultant, not an agent loop.** At 6 tok/s a 500-token answer takes 80 seconds and a
+   2,000-token answer takes five and a half minutes. Asking one hard question and waiting is
+   entirely reasonable. Driving forty tool calls through it is not, and no amount of engineering
+   changes that.
+2. **The four-GPU node buys almost nothing here, and that is the surprise.** With 1 TB of RAM the
+   whole 372 GB model is RAM-resident, and colibrì's own controlled measurement puts the VRAM-versus
+   -RAM placement difference at **under 2 %** once that is true. What the GPU is for is the *dense
+   and attention* tensors — about 23 GB, which fits on **one** A40. compute306 is not needed for
+   capacity.
+3. **The cold start, not the GPU, is the hard constraint.** 372 GB off the studies share at a
+   measured ~230 MB/s is **~27 minutes** before the first token. That single number drives the
+   partition choice (§4), the citizenship design (§7), and why this service cannot be treated as
+   yieldable in the way an ollama server was.
+
+---
+
+## 2. What colibrì is, in one paragraph
+
+A 744B-parameter MoE activates ~40B parameters per token, and only the routed experts change from
+token to token. colibrì therefore does not load the model — it **places** it. The dense part
+(attention, shared experts, embeddings, ~17B params, ~9.9 GB at int4) stays resident; the 19,456
+routed experts (~19 MB each) live across VRAM, RAM and disk as tiers of one hierarchy, staged on
+demand with a per-layer LRU, a learned pinned hot-store, and one-layer-ahead prefetch. Placement
+decides *speed only*: the router's decisions and the weights' precision are identical whether an
+expert answered from VRAM or from disk. It is a single C file, no BLAS, no Python at runtime, and
+it serves exactly one generation at a time.
+
+---
+
+## 3. The performance model — where the speed comes from and where it stops
+
+This is the section to read before arguing about hardware. Everything is bandwidth arithmetic on a
+per-token expert working set.
+
+### 3.1 The governing equation
+
+From colibrì's own instrumented run (`docs/experiments/glm52-4xa6000-2026-08-02.md` §5):
+
+```
+expert weights touched per token = 8 experts × 20.1 MB × 75 layers = 12.1 GB
+time per token ≈ (bytes served from RAM) / (achieved RAM read bandwidth)
+```
+
+That is the whole ceiling. Everything else — tiering, pinning, context length, KV width — is
+bounded above by it. On the 4×A6000 reference host the CPU-side routed path sustained
+**19.67 GB/s** against ~85 GB/s of theoretical DDR4-2400, i.e. 23 % of the machine, and the
+resulting ceiling was **3.0 tok/s**.
+
+### 3.2 Why our node is the good case
+
+| | reference host (4×A6000) | **LIBR compute30x** |
+|---|---|---|
+| CPU | EPYC 7402P, Zen 2, 24c/48t, **AVX2 only** | 2× Xeon Gold 6342, Ice Lake-SP, **48c/96t**, **AVX-512 + VNNI** |
+| NUMA | 1 node | **2 nodes**, 515 GB each, distance 20 |
+| RAM | 264 GB DDR4-2400, ~85 GB/s | **1 TB DDR4-3200**, ~410 GB/s across two sockets |
+| model residency | 367 of 429 GB — **disk stays in the path** | **372 GB of 1 TB — the entire model, RAM-resident, disk leaves the decode path permanently** |
+| GPU | 4× A6000 48 GB, sm_86 | 1–4× A40 46 GB, **sm_86 — same generation** |
+| storage | local NVMe, 2.86 GB/s | NFS, **0.23 GB/s** — 12× worse, and it only affects cold start |
+
+Two of those matter and the rest are detail. **AVX-512 VNNI** gives the int4 dot-product kernels a
+path the reference host did not have, and colibrì selects it automatically at compile time. **1 TB
+of RAM** removes disk from decode entirely, which is the configuration behind every good number in
+colibrì's experiment set and which the reference host could not reach.
+
+### 3.3 What the GPU is actually for
+
+`CUDA_DENSE=1` was worth **×2.8** on the reference host (1.53 → 4.26 tok/s) and is **not mentioned
+in colibrì's public README**. It moves the dense and attention tensors onto the GPU. It was decisive
+because attention dominates decode as a generation lengthens — 64 % of decode time on a 750-token
+answer, 26 % on a 64-token one.
+
+Those tensors cost ~12 GB, plus ~11 GB of KV cache at 32k context. **23 GB — one A40 holds it.**
+
+What four cards would add is expert residency in VRAM, and colibrì's own controlled A/B says that is
+worth almost nothing once RAM residency is achieved: VRAM-heavy (188 GB) measured 2.81 tok/s against
+balanced (176 GB) at 2.78 — indistinguishable — while raising the *RAM* budget from 205 to 235 GB
+bought **+25 %**. An arithmetic check in the same report puts the VRAM/RAM bandwidth differential at
+~1.3 ms of a 77 ms token, **under 2 %**.
+
+> **Therefore: one A40, not four.** This is the same conclusion `DESIGN.md` §4.1 reached, but for a
+> stronger reason than it had. It also means the service never touches compute306 for capacity,
+> which is the best citizenship story available to us.
+
+### 3.4 The number, and where it comes from
+
+colibrì's source carries measurements taken on a **2-socket Ice Lake 48-core host with GLM-5.2 int4
+fully resident** — the same CPU generation, core count, and residency condition as ours. From
+`c/colibri.c`:
+
+| condition | tok/s | expert-matmul | source |
 |---|---|---|---|
-| `c3_short` | **20** | OFF | NO |
-| `c3` | **10** | **SUSPEND** | FORCE:1 |
-| `c3_accel` | **10** | **SUSPEND** | FORCE:1 |
+| int4 IDOT off at S=1 (pre-VNNI baseline) | 3.65 | 67.8 GB/s | `colibri.c:541` |
+| **AVX-512 VNNI int4 IDOT** (automatic when compiled for it) | **3.85** | **89.5 GB/s** | `colibri.c:541` |
+| baseline in the XEXP campaign | 4.20 | — | `colibri.c:554` |
+| **+ `XEXP=1`** (one OpenMP region per batch-union block) | **4.68** | **131.9 GB/s** | `colibri.c:554` |
 
-`c3` and `c3_short` are the same six nodes. A job in `c3` is therefore preemptible by any job in
-`c3_short`, and the configured preemption action is **suspend** — `SIGSTOP`, not requeue, not
-cancel.
+Those runs are **CPU-side**; none of them mentions `CUDA_DENSE`. Adding one A40 to take the dense
+and attention path is the ×2.8 lever on a host where the CPU was the bottleneck — ours is far
+stronger, so expect less, but attention is 26–64 % of decode and moving it is aimed at the phase
+that dominates.
 
-Two consequences, and the second is worse than the first:
+> **Projected: 6–12 tok/s, most likely around 8.** *Projection*, from measured components: a
+> measured 4.68 tok/s CPU-side floor on our CPU class, times a partial capture of a measured ×2.8
+> GPU lever. The first real measurement replaces this line.
+>
+> `XEXP=1` was **neutral or negative on a 24-core box** and is opt-in for that reason. On 48 cores it
+> is the single largest CPU-side lever available. Measure it; do not assume it.
 
-- A suspended process **keeps its GPU memory**. Slurm's suspend does not release VRAM, so the
-  `c3_short` job that preempted us cannot use the card anyway. The preemption helps nobody.
-- A suspended `ollama serve` is frozen mid-generation with an open socket. The client does not get
-  an error. It gets **nothing**, indefinitely, and the symptom reads as a hung model.
+### 3.5 What does not help, with evidence
 
-`README.md` §4 currently advises "switch the file to `c3` if you want a server to outlive 9 hours."
-**That advice is a trap and must be corrected.** The fleet lives on `c3_short` and buys longevity
-from the restart chain (§5), not from a longer walltime in a preemptible partition.
+- **More GPUs** — §3.3. Under 2 % once RAM-resident.
+- **Concurrency.** The engine serialises: 1.32 / 1.51 / 1.46 tok/s aggregate at 1 / 2 / 4 clients.
+  Two measurement clients at once produce erratic numbers and must be discarded. A colibrì backend
+  is a **single-slot resource**; queue for it, never load-balance onto it.
+- **Prefetch machinery, once resident.** Removing `URING` + `PILOT*` was worth **+26 %**: with
+  experts resident the disk reads 0 MB/s during decode, so the overlap machinery only consumes CPU,
+  which is the scarce resource. Keep `DIRECT=1 PIPE=1`.
+- **Maximising memory blindly.** With the dense path on the CPU, a 176 GB/188 GB configuration
+  measured *slower* than a 99 GB one. Gains do not compose; two settings aimed at the same residual
+  miss do not add.
+- **Longer context, for free.** Decode falls 23 % going from 32k to 131k, with no cliff up to 196k
+  and prefill flat at 148–198 tok/s. `CTX=131072` is the recommended point.
 
-`c3_accel` is also tier 10 with SUSPEND, but no higher-tier partition contains compute306, so
-nothing can preempt there. It is safe for the reason that it is the only partition on that node —
-which is not a reason that will survive a scheduler reconfiguration. Check it in P0 each time.
+### 3.6 The NUMA question, which is ours alone to answer
 
-*Status: inferred from partition configuration, not observed. P0 test 1 observes it.*
+The reference host was single-socket. We have **two NUMA nodes of 515 GB each, distance 20**, and
+the model is 372 GB. Two configurations, and they are genuinely different machines:
 
-### 2.2 Memory asks silently buy CPUs, and the minimum billable unit is two.
+- **One socket.** `numactl --cpunodebind=0 --membind=0`. 24 cores, ~205 GB/s, every expert access
+  local. **The model fits inside one NUMA node with 143 GB to spare** — this is the clean case, and
+  it is not obvious it loses.
+- **Both sockets interleaved.** `COLI_NUMA=1`. 48 cores, ~410 GB/s aggregate, but half of all expert
+  reads cross UPI at 2× the latency. This is the configuration the 4.68 tok/s figure came from.
 
-`DefMemPerCPU=6000, MaxMemPerCPU=12000` on all three partitions, `SelectTypeParameters=CR_CORE_MEMORY`,
-`ThreadsPerCore=2`. Two separate effects:
-
-- **Whole-core allocation, proven.** Live job 2070710 requested `cpu=1,mem=6000M,billing=1` and was
-  allocated `cpu=2,mem=12000M,billing=2`. A one-CPU ask costs two. There is no smaller unit.
-- **`MaxMemPerCPU` inflation, inferred.** A memory ask above 12 GB per requested CPU forces Slurm to
-  raise the CPU count. `ollama_serve.sbatch` asks `--cpus-per-task=4 --mem=64G`, which is 16 GB per
-  CPU, so it should actually allocate **6** CPUs. `ollama_serve_accel.sbatch` asks 8 CPUs and 128 GB
-  and should allocate **11**.
-
-This matters because `README.md` §4 and `DESIGN.md` §6.3 both build an argument on right-sizing the
-CPU ask — an 8-CPU ask once left a job queued behind nodes with an idle A40 and four free CPUs. That
-argument is correct and the numbers in it are wrong: the memory line was buying CPUs the whole time.
-
-**Action in P0:** read `AllocTRES` off a live `ollama_serve` job and record the real number in
-`README.md`. Then either lower `--mem` or raise `--cpus-per-task` deliberately, so the file says what
-the job actually takes.
-
-### 2.3 An always-on supervisor costs roughly as much fair-share as everything we currently run.
-
-`sshare` for this account on 2026-09-09: `RawShares=1, NormShares=0.125, RawUsage=548706,
-EffectvUsage=0.203247, FairShare=0.146552`. We are already consuming more than our share.
-`PriorityWeightFairShare=15000` dominates every other weight (`Partition` 10000, `JobSize` 2000,
-`Age` 1000), and `PriorityDecayHalfLife` is 2 days.
-
-A supervisor job holding the two-CPU floor around the clock adds 172,800 billing-seconds per day.
-At a two-day half-life that reaches a steady-state RawUsage contribution near 500,000 — **about the
-size of our entire current usage.** `DESIGN.md` §1 named fair-share as the quiet cost and was right;
-this is the number.
-
-It is not fatal. It is also not nothing, and it lands on the PSYCH-ASR and TRD-EHR jobs the fleet
-exists to serve. Hence the design in §5: the supervisor **exits when it has held nothing for a
-configured idle period**, and the client commands resurrect it. A fleet that holds no GPUs overnight
-is, from the user's seat, identical whether or not a supervisor is watching it hold nothing.
-
-Default `idle_exit_minutes: 120`. Set it to `0` for a genuinely permanent daemon and accept the
-fair-share bill, which is a decision for the user (§11), not for the assistant.
-
-### 2.4 Nearly every pending job on this cluster is `BeginTime`, not `Resources`.
-
-Of the 27 pending jobs visible on 2026-09-09, **every single one** had `Reason=BeginTime` — jobs
-deliberately scheduled to start later, not jobs blocked by anything we hold. Zero were waiting on
-`Resources`.
-
-This is the single largest false-positive source for the yield logic, and it is load-bearing:
-a naive "somebody is pending, give a node back" rule would yield the entire fleet continuously in
-response to jobs that are not waiting on us and would not start any sooner. The predicate in §6.2
-filters on `Reason` explicitly and the filter is not optional.
-
-It also means the yield path will be **rarely exercised in normal operation**, so it must be tested
-deliberately rather than waited for. §6.4 says how.
+`coli tune` sweeps OpenMP thread count and NUMA policy on the real model and machine, and
+disqualifies any candidate whose greedy output drifts by a byte. Use it rather than guessing — and
+note that colibrì's own report names the thread-count sweep as *"the single most valuable
+measurement still outstanding"* on this axis.
 
 ---
 
-## 3. The shape of the thing
+## 4. Placement, and the partition problem that has no clean answer
 
-Five pieces. Build them in this order; each is useful before the next exists.
+The colibrì backend wants: **1 GPU, ~500 GB RAM, as many cores as the node will give, and a life
+long enough that a 27-minute cold start amortises.**
 
-```
-  fleet (bin/fleet)          one client command, runs anywhere including the login node
-      |
-      | reads               ${FLEET_STATE}/inventory.json   (a cache the supervisor publishes)
-      | writes              ${FLEET_STATE}/STOP             (the kill switch)
-      |
-  fleetd (supervisor)        a 2-CPU Slurm job on c3_short that self-chains across walltimes
-      |                      derives everything from squeue; one action per cycle
-      |
-      +-- acquires/yields -> backend jobs (ollama today; vLLM, colibrì later)
-      |                      each writes a heartbeat file; each binds loopback on its own node
-      |
-  front door                 P4a: fleet code steps onto the backend's node (works day one)
-                             P4b: a loopback router on the CLIENT's node, relaying over
-                                  srun --overlap stdio (no cross-node socket, no PHI weakening)
-```
+`MaxMemPerCPU=12000` couples the memory ask to the CPU ask (`README.md`, and §2.2 of the previous
+revision): 500 GB forces at least 42 CPUs, and we want the cores anyway. `MaxCPUsPerNode=92`.
+So the honest description of the ask is **`--gres=gpu:1 --cpus-per-task=92 --mem=500G`, which is
+essentially one whole node of the six.** Say that out loud in any conversation about this service;
+it is not a small job wearing a small costume.
 
-Two rules inherited from `README.md` §4a and `DESIGN.md` §5.1, and they are absolute:
+Now the partition, and this is the genuinely hard part:
 
-1. **Inventory is derived from Slurm, never stored.** A state file goes stale the instant a job ends.
-2. **Policy state is not inventory state.** The hold-off record (§6.3) *is* a file, and it must be —
-   it records a decision the fleet made, which Slurm cannot tell you. Do not let rule 1 delete it.
+| partition | time limit | preemption exposure | GPUs | verdict |
+|---|---|---|---|---|
+| `c3_short` | **9 h** | none (`PriorityTier=20`, `PreemptMode=OFF`) | 1 | safe, but 27 min of every 9 h is a cold start — **5 % duty lost, 2.7 restarts a day** |
+| `c3` | 7 d | **`SIGSTOP` by any `c3_short` job** (tier 10, `SUSPEND`) | 1 | long enough, but a suspended generation hangs the client with no error (§9.1) |
+| `c3_accel` | 7 d | **none in practice** — no higher-tier partition contains compute306 | 4 | the only place offering *both* a long life and no preemption |
 
----
+**The inversion worth noticing:** having argued in §3.3 that we do not need compute306's cards, the
+strongest reason to run there is its *partition*, not its GPUs. It is the only combination on this
+cluster of a 7-day limit and no preemption exposure, and a 27-minute cold start is exactly the
+workload that cares.
 
-## 4. File layout
+That is decision 1 in §11 and it is not mine to make. The plan's default is **`c3_short` with the
+restart chain**, because holding the cluster's only four-GPU node for a service that measurably does
+not need four GPUs is indefensible however convenient the partition is. Take the 5 %.
 
-Everything user-space, everything tracked, no new runtime dependencies.
-
-```
-libr-local-llm/
-  bin/
-    fleet                       # the one client command
-  fleet/
-    __main__.py                 # supervisor entry point
-    slurmview.py                # squeue/scontrol parsing -> typed records
-    inventory.py                # what the fleet holds, derived each cycle
-    policy.py                   # caps, idle release, the yield ladder, hold-off
-    backends.py                 # engine adapters; ollama first
-    relay.py                    # P4b only: the srun stdio relay
-  slurm_jobs/
-    fleet_supervisor.sbatch
-    fleet_ollama.sbatch         # parameterized replacement for ollama_serve.sbatch
-  config/
-    fleet.json                  # declarative desired capacity, caps, timeouts
-```
-
-**Interpreter: `/usr/bin/python3.11`, named explicitly.** `/usr/bin/python3` is 3.9 on these nodes
-and lacks `tomllib`; the venv on `PATH` belongs to PSYCH-ASR and must not be a dependency of the
-serving layer. Standard library only — no pip install, nothing to break on a node that has not
-been set up.
-
-**Config is JSON, not TOML**, matching `config/opencode.json`, so the 3.9-vs-3.11 question never
-becomes load-bearing.
-
-**`config/fleet.json` needs a `.gitignore` exception.** The repo ignores `*.json` wholesale with
-named exceptions for `config/opencode.json` and `config/claude-settings.json` — a PHI belt-and-
-braces rule. Add `!config/fleet.json` in the same block, or the config silently never gets
-committed.
-
-**State lives outside the repo:** `FLEET_STATE`, defaulting to `~/.local/state/fleet`. The repo is
-public (`README.md` header) and holds no runtime state. Create it in `bin/fleet` on first use.
+**Page cache is the mitigation nobody has costed.** A node has 1 TB of RAM and the model is 372 GB.
+A restart that lands on the *same* node may find much of the container still in page cache and skip
+most of the 27 minutes. Measure it in P0 (test 9); if it holds, `c3_short` plus `--nodelist` affinity
+becomes much cheaper than the table above suggests, and the argument for `c3_accel` weakens further.
 
 ---
 
-## 5. P1 — the supervisor, the chain, and the kill switch
+## 5. The supervisor, the chain, and the kill switch
 
-Ship this first. It is the piece the user actually asked for, and it is testable with no GPU at all.
+**Unchanged from the previous revision.** A 2-CPU Slurm job on `c3_short` that derives everything
+from `squeue` and keeps no inventory state, submits its own successor at birth with
+`--dependency=afterany:$SLURM_JOB_ID`, checks `${FLEET_STATE}/STOP` before anything else, and takes
+one action per 30-second cycle with the reason logged. `fleet down` writes `STOP` first, then
+cancels. A systemd `--user` timer is the once-a-day backstop, on the same `Persistent=true` pattern
+as `colibri-pull` and `harden-claude`, and for the same reason: crontab is refused by PAM here.
 
-### 5.1 The job
+Two changes the pivot forces:
 
-`slurm_jobs/fleet_supervisor.sbatch`:
-
-```
-#SBATCH --job-name=fleetd
-#SBATCH --partition=c3_short          # tier 20, PreemptMode=OFF. See §2.1. Never c3.
-#SBATCH --time=0-08:45:00             # under the 9 h cap with room for a clean handoff
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=1             # allocates 2; there is no smaller unit (§2.2)
-#SBATCH --mem-per-cpu=4G              # per-CPU, so it does not silently buy more CPUs
-#SBATCH --no-requeue                  # the chain handles restarts; a requeue would fork it
-#SBATCH --signal=B:TERM@120           # B: signals the batch shell, not the steps
-#SBATCH -o slurm_jobs/logs/fleetd_%j.out
-#SBATCH -e slurm_jobs/logs/fleetd_%j.err
-```
-
-No `--gres`. The supervisor never touches a GPU.
-
-`--signal=B:TERM@120` is what gives the supervisor two minutes to drain before Slurm kills it.
-The `B:` prefix is mandatory — without it the signal goes to the job steps and the batch shell
-never sees it. Trap it in the script and in Python (`signal.SIGTERM`), and on receipt: stop
-acquiring, publish a final inventory, exit 0.
-
-The script sources `~/.bashrc` **before** `set -e` (`README.md` §7.6) and scrubs `SLURM_*` before
-any nested `sbatch` (`README.md` §7.19). Both are non-negotiable and both have already cost this
-repo a debugging session.
-
-### 5.2 The chain
-
-At startup, before entering the loop:
-
-1. **Check the kill switch.** If `${FLEET_STATE}/STOP` exists, log its contents and exit 0. Do this
-   first, before anything else, or `fleet down` cannot beat a pending successor to the punch.
-2. **Check for a duplicate.** `squeue -u $USER -n fleetd -t RUNNING -h -o %i`. If any id other than
-   our own is running, log and exit 0. This is the anti-fork lock and it needs no lockfile — Slurm
-   already knows.
-3. **Submit the successor**, once: `sbatch --parsable --dependency=afterany:$SLURM_JOB_ID
-   --kill-on-invalid-dep=yes ...` with `SLURM_*` scrubbed. Skip it if a `fleetd` job is already
-   PENDING.
-
-`afterany` fires on *any* termination — walltime, node failure, `scancel`, a crash. That is the
-property that makes the chain a restart mechanism rather than just a rollover. It is also why the
-STOP check in step 1 has to be the first thing: `fleet down` cancels a generation, the successor
-starts anyway, and the STOP file is what turns it around in two seconds.
-
-The pending successor sits in the queue for ~8.75 h. Pending jobs are not billed, so this costs
-nothing but a visible line in `squeue`. Leave it visible; a hidden restart mechanism is worse.
-
-### 5.3 The kill switch
-
-`${FLEET_STATE}/STOP`, containing one line: an ISO timestamp and who or what wrote it.
-
-Checked at supervisor startup, at the top of every cycle, and by `fleet up` (which refuses to start
-while it exists). `fleet down` writes it *first*, then cancels the PENDING `fleetd`, then the
-RUNNING one, then drains and cancels the backends. In that order — reversing it races the chain.
-
-`fleet up` removes it. Nothing else does.
-
-This works when `squeue` is unreachable, when the supervisor is wedged, and when the node it was
-on has vanished. A kill switch that depends on the thing it kills is not one.
-
-### 5.4 Backstop resurrection
-
-The chain covers everything except "the chain itself died and nothing noticed" — a `scancel -u` by
-an admin, a scheduler restart that flushes the queue, a bad deploy.
-
-Add a systemd `--user` timer on the §2.1/§2.2 pattern already in this repo (`README.md` §2.1 for
-why `Persistent=true` is load-bearing and why cron is not available): once a day, if `STOP` is
-absent and no `fleetd` job exists, submit one. Tracked copies in `config/`, same as
-`colibri-pull` and `harden-claude`, for the same reason — a documented timer whose script is not
-tracked rebuilds into a dead unit.
-
-This is a backstop, not the mechanism. If it is firing regularly, the chain is broken; find out why.
-
-### 5.5 The loop
-
-One action per cycle (`DESIGN.md` §5.1). Cadence 30 s — not "every few seconds", which is
-`DESIGN.md` §14.8's anticipated trap: a supervisor polling `squeue` hard across six nodes is rude
-in a smaller way than squatting, and an admin notices it before we do.
-
-```
-every 30s:
-  if STOP exists                      -> drain, publish, exit 0
-  observe   = read squeue + heartbeats           (never a state file)
-  desired   = read config/fleet.json
-  decide    = policy(observe, desired, holdoff)  -> at most ONE action
-  act       = submit | drain | cancel | nothing
-  publish   = write inventory.json atomically (write temp, rename)
-  log       = one line per decision, WITH ITS REASON
-```
-
-"With its reason" is a requirement, not a nicety. `DESIGN.md` §5.1: when somebody asks why the
-fleet took a node at 3 a.m., the answer has to exist.
-
-### 5.6 P1 exit criteria
-
-Do not start P2 until all four pass.
-
-1. `fleetd` survives two walltime rollovers — three generations, >18 h of continuous service — with
-   no human action and no gap longer than the queue's start latency.
-2. `fleet down` stops it within 30 s and **no** generation restarts afterwards. Verify by leaving it
-   alone for an hour and checking `squeue`.
-3. `scancel` on the running generation, with `STOP` absent, results in the successor taking over.
-4. Killing the supervisor never affects a backend. Start a backend by hand, kill the supervisor,
-   confirm the backend is still serving, restart the supervisor, confirm it adopts it rather than
-   duplicating it. (`DESIGN.md` §5.1: killing the supervisor must never be the thing that takes the
-   service down.)
+- **Readiness is not "listening".** colibrì takes ~27 minutes to first token. A readiness timeout
+  written for ollama fires at 3 % of the way through and the supervisor concludes the backend failed
+  — `DESIGN.md` §14.3 anticipated exactly this. Readiness is `GET /health` answering **and** a
+  one-token generation completing. Timeout 45 minutes, not 5.
+- **The fair-share arithmetic gets worse and the answer is the same.** The supervisor's own 2-CPU
+  floor still costs roughly our entire current recent usage if it runs around the clock (previous
+  revision §2.3). `idle_exit_minutes: 120` stays the default. But note the colibrì backend itself
+  now bills ~92 CPUs whenever it exists, which dwarfs the supervisor entirely — the honest framing
+  is that **the backend is the fair-share cost and the supervisor is a rounding error.**
 
 ---
 
-## 6. P2 and P3 — backends, caps, and giving them back
+## 6. The front door — and colibrì hands us a better one than opencode
 
-### 6.1 Backend management (P2)
+colibrì's HTTP server speaks **three** protocols on one port: OpenAI `/v1/chat/completions`, the
+**Anthropic Messages API at `/v1/messages`**, and its own. GLM-5.2 supports OpenAI `tools` *and*
+Anthropic `tool_use`, with `<tool_call>` blocks natively.
 
-Replace the two hand-written sbatch files with one parameterized `fleet_ollama.sbatch` taking model
-and profile through `--export`. Keep `ollama_serve.sbatch` and the `ollama-*` commands working
-untouched throughout — they are proven, and `DESIGN.md` §8 says the fleet commands are additive.
+That means **Claude Code itself points at the local model with three environment variables** —
+`ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` — with no shim and no translating
+proxy. The terminal experience the user actually wants is the one they already have, against local
+weights.
 
-Each backend job gains one thing the current ones lack: **a heartbeat.** A background loop inside
-the sbatch writes `date +%s` plus the node name into
-`${FLEET_STATE}/backends/<jobid>.hb` every 30 s, alongside `ollama serve` in the foreground.
+Prefer it to opencode for this service, and keep opencode configured as the fallback. Three things
+that follow:
 
-The heartbeat is how the supervisor health-checks a backend on another node **without an `srun`
-step per backend per cycle**. NFS home is mounted everywhere; a file read costs the scheduler
-nothing. Staleness over 120 s means unhealthy.
+- **colibrì has an API key and ollama does not.** `COLI_API_KEY` closes the gap recorded as live in
+  `README.md` §7.20: loopback is not a boundary against other users on the same node, and until now
+  nothing else was. **Set it on every backend that exists.** This is a strict improvement in the PHI
+  posture, and it is the reason `DESIGN.md` §9 named "does this engine support an API key" as a
+  selection criterion.
+- **`KVSAVE=0` is mandatory on any PHI path.** colibrì persists conversation KV state to a dot-file
+  **inside the model directory** by default, roughly 182 KB per token, so that conversations reopen
+  warm. Pointed at a model on the studies share that is PHI-derived state accumulating on shared
+  storage. Turn it off, and keep the slot-to-slot KV prefix adoption disabled too.
+- **The cross-node problem is unchanged**, and so is the answer: `srun --overlap` stdio relay (§7.2
+  of the previous revision), or simply step onto the backend's node. With one long-lived backend
+  instead of an elastic pool, stepping on is very nearly good enough, and the relay drops to a
+  convenience rather than a requirement.
 
-Read the **contents**, never the mtime. NFS attribute caching will lie to you about mtime for
-several seconds; the timestamp written inside the file cannot.
+`COLI_MAX_QUEUE` (default 8) and `COLI_QUEUE_TIMEOUT` (default 300 s) give a bounded FIFO with
+OpenAI-shaped 429s and a `x-colibri-queue-wait-ms` header. That is the single-slot queueing
+`DESIGN.md` §5.5 asked for, already built.
 
-Readiness stays what it already is: grep the stderr log for `Listening on`, after truncating it
-(`README.md` §7.17), and refuse to report success unless `AllocTRES` contains `gres/gpu=`
-(`README.md` §7.10 and §4a). Never report success from a submission (`DESIGN.md` §7.4).
+---
 
-Standing limits, all from `config/fleet.json`, all enforced every cycle:
+## 7. Citizenship, under a service that cannot cheaply be given back
 
-| knob | proposed default | why |
+This is where the pivot costs something real and the plan should not pretend otherwise.
+
+An ollama replica was 18.6 GB and came back in 90 seconds, so yielding it was nearly free. A
+colibrì backend holds ~500 GB of RAM and a whole node's cores for 27 minutes of reload. **The yield
+ladder still applies but it now has one rung**, and pulling it takes the service down for half an
+hour.
+
+What survives, and it is not nothing:
+
+- **We hold one GPU of seven, and never compute306.** The scarcest resource on the cluster is
+  untouched. That is a better citizenship position than the previous plan's two-of-six.
+- **Hard caps still bind.** One backend. Never a second. Never `c3_accel` without an explicit
+  request.
+- **Idle release still applies, on a much longer clock.** Nothing has used it in `idle_release_minutes`
+  → give the node back. Default **180 minutes**, not 30: releasing a 27-minute asset over a lunch
+  break is the thrashing `DESIGN.md` §10 warns about, where a fleet that thrashes is worse than a
+  fleet that is simply smaller.
+- **The hold-off is unchanged and still the first bug to expect.** Do not re-request until the
+  triggering job is no longer pending, floor 15 minutes.
+- **The yield predicate is unchanged and the `BeginTime` filter is still the load-bearing part** —
+  every pending job on this cluster on 2026-09-09 was `BeginTime`, not `Resources`.
+
+**What must be recorded honestly:** yielding this service costs the user 27 minutes of downtime, so
+the supervisor will do it reluctantly and rarely, and the fair-share bill for ~92 CPUs is paid
+continuously while it exists. If that is not acceptable, the answer is a shorter walltime and more
+frequent release, not a smarter policy.
+
+---
+
+## 8. vLLM — narrowed, and now clearly not in competition
+
+colibrì serves **one generation at a time**. It cannot do corpus work, at any tuning, ever. So the
+two engines stop overlapping entirely and the router that was going to arbitrate between them is not
+needed:
+
+| | colibrì | vLLM |
 |---|---|---|
-| `max_c3_nodes` | 2 | six exist; the fleet never gets all six regardless of how idle it looks |
-| `max_accel_bookings` | 0 | opportunistic only, and only via `fleet up --big` (§11 decision 3) |
-| `idle_release_minutes` | 30 | one level up from ollama's 20-minute VRAM keep-alive: this releases the *node* |
-| `accel_idle_minutes` | 10 | the scarcest thing on the cluster gets the shortest leash |
-| `idle_exit_minutes` | 120 | the supervisor's own exit when it holds nothing (§2.3) |
-| `cycle_seconds` | 30 | §5.5 |
+| workload | one hard question, interactively | ten thousand documents, unattended |
+| model | GLM-5.2 744B int4 | MedGemma 27B, 8-bit |
+| shape | one long-lived backend, single slot | N single-GPU replicas, continuous batching |
+| plane | HTTP on loopback, Anthropic protocol | **filesystem work queue, no socket at all** |
+| why | frontier reasoning on PHI | PSYCH-ASR Stage 3c, schema-guided JSON |
 
-"Idle" means no request has reached the backend, which the supervisor learns from the ollama access
-log (`[GIN] ... POST /v1/chat/completions` lines in the job's stdout — visible in the existing logs
-today) rather than by polling the API. Reading a log costs nothing and does not itself count as
-activity, which polling would.
+vLLM keeps `DESIGN.md` M0/M1 unchanged: user-local conda prefix, single-GPU replicas rather than
+tensor-parallel shards (no NVLink, and a replica is yieldable one at a time), driven by a filesystem
+work queue on the studies share with atomic-rename claiming. That queue is the strongest PHI control
+in the whole design because it removes the socket entirely, and it is preemption-tolerant for free.
 
-**P2 exit criteria.** Cancel a backend by hand: a replacement is up and `fleet status` reports the
-change without being asked. Leave a replica untouched past `idle_release_minutes`: it is released.
-Set the config to ask for more replicas than `max_c3_nodes` allows: the cap holds and the supervisor
-logs that it is holding it.
-
-### 6.2 The yield predicate (P3)
-
-A foreign pending job counts as **blocked by us** only when every one of these holds:
-
-- `user != $USER`
-- `state == PENDING`
-- `reason ∈ {Resources, Priority}` — **`BeginTime` is excluded and this is the filter that matters**
-  (§2.4: on the day this was written, every pending job on the cluster was `BeginTime`)
-- its partition is one of `c3`, `c3_short`, `c3_accel`
-- its ask includes a GPU (`tres-per-node` contains `gpu:`, or `ReqTRES` contains `gres/gpu`)
-- it has held that state for ≥ 120 s — a job about to start does not need our help
-- the fleet currently holds ≥ 1 GPU in a partition that overlaps its own
-
-Treat the two reasons differently. `Resources` means the scheduler cannot find what the job needs
-and is the strong signal: yield immediately. `Priority` means something outranks it, which may have
-nothing to do with us: yield only if it persists ≥ 10 minutes **and** we hold ≥ 2 nodes. Both
-thresholds are config knobs.
-
-Cross-check with `squeue --start`, which gives Slurm's own estimated start time. A job with a start
-estimate inside the next few minutes does not need a yield.
-
-We will sometimes yield for nothing. `DESIGN.md` §6.1 already settled that trade: yielding
-occasionally for nothing is correct against being the group that has to be emailed.
-
-### 6.3 Drain, then cancel, then hold off
-
-Yielding is two steps and never one (`DESIGN.md` §6.4). Mark the backend draining so no new work is
-routed to it, let in-flight generations finish, **then** cancel. A yield that kills a generation
-mid-stream will be reported as "the local model is unreliable", and the report will be correct.
-
-Release order is the ladder in `DESIGN.md` §6.2, unchanged: idle vLLM replica, idle ollama server,
-`c3_accel` booking, busy vLLM replica, colibrì last. In P3 only the ollama rungs exist.
-
-Then the hold-off, which is the fleet's first real bug waiting to happen (`DESIGN.md` §6.5 and
-§14.1): the supervisor releases a node, its own convergence loop notices it is below target, and
-re-submits — beating the pending job it was trying to help.
-
-`${FLEET_STATE}/holdoff.json`, one record per released resource class:
-
-```json
-{"c3_short:gpu1": {"job": "2070999", "user": "someone", "until": 1757450000, "released": 1757448200}}
-```
-
-The rule: **do not re-request that class until the triggering job is no longer PENDING, and in no
-case sooner than `holdoff_floor_minutes` (default 15).** Whichever is later. If the job is still
-pending an hour on, it was never blocked by us — expire the record and let the loop regrow, logging
-that the yield did not help.
-
-This file is the exception to "keep no state file" and §3 rule 2 explains why: it records a decision
-the fleet made, and Slurm has no memory of it.
-
-### 6.4 Proving the yield works, when the cluster will not cooperate
-
-§2.4 means the yield path may not fire for weeks. `DESIGN.md` M3's exit criterion — "demonstrably
-yields a node to a pending foreign job" — cannot be manufactured, because we cannot submit as
-another user.
-
-Test it with our own second job behind an explicit flag: `fleet test-yield`, which flips the
-`user != $USER` filter off for one run. Submit a GPU job of our own while the fleet holds every
-eligible node, watch the supervisor detect it as blocked, watch the drain, the cancel, the hold-off
-record, and the refusal to re-acquire until our test job starts. Then check that the hold-off count
-of "reacquisitions that beat the job they yielded to" is **zero**, which is `DESIGN.md` §13's
-stated bar.
-
-Instrument every real yield permanently: the triggering job id, whether it subsequently started,
-and how long after. `DESIGN.md` §13 lists that as the fleet's central unmeasured claim. It stays
-unmeasured until this logging exists.
-
-**P3 exit criteria.** The `fleet test-yield` sequence completes with a clean drain, a correct
-hold-off, and no early reacquisition. The `BeginTime` filter is verified against the live queue:
-with 20+ `BeginTime` jobs pending, the supervisor yields nothing.
+**Do not build a router between these two.** They share no caller and no workload.
 
 ---
 
-## 7. P4 — the front door
+## 9. The model menu inside colibrì
 
-`DESIGN.md` §5.4 leaves this open and it is the only genuinely hard problem in the plan. Backends
-bind loopback on their own node, which is the PHI control, and loopback does not compose across
-nodes.
+Eight families run on the same engine. Only these are viable here, and the filter is brutal: it must
+fit in 1 TB of RAM, and it must support tool calling or it cannot drive a terminal client.
 
-### 7.1 P4a — attach, don't route (ships first, works today)
+| model | total / active | container | tool calling | verdict |
+|---|---|---|---|---|
+| **GLM-5.2** | 744B / 40B | **372 GB** | **yes** (OpenAI + Anthropic) | **the default.** The reference model, the best-measured path, the one every number in §3 belongs to |
+| **DeepSeek V4 Flash** | 284B / **13B** | 167 GB (REAP-150B: 85 GB) | **yes**, native DSML | **measure it.** One third the active parameters should mean materially less per-token traffic; the only figure in its doc is 1.5–1.6 tok/s on an unnamed host, so this is a hypothesis, not a recommendation |
+| **GLM-5.3-Flash** | 321B / 40B | ~195 GB converted | yes | a lighter GLM; same family, needs conversion |
+| Inkling | 975B / 41B | 469 GB | **no** — HTTP 400 on tools | unusable for a terminal client |
+| Kimi K3 | 2.8T / 104B | **~1.6 TB** | yes | **does not fit in RAM.** At 230 MB/s from NFS it would stream forever. Dead here |
+| Qwen3.8-Flash-Next | 125B / 6B | 185 GB | no | unusable for a terminal client |
+| Qwen3.6-35B-A3B | 35B / 3B | ~20 GB | — | same class the user just rejected; noted only because the CUDA VRAM tier measured **1.44 → 10.05 tok/s** on it |
 
-`fleet code` is `ollama-code` with the node lookup widened: instead of finding *the* ollama job, it
-reads the published `inventory.json`, picks the backend serving the model asked for, and
-`srun --overlap`s the opencode TUI onto that node. Everything else — the `SLURM_*` scrub, the
-resident-model adoption, the session flags — carries over unchanged from `bin/ollama-code`.
-
-What the user gets: one command, no node names, no ports, no job ids. What they do not get: a
-session that survives its backend being yielded. When the node goes, the TUI goes.
-
-That is less bad than it sounds, and the reason is already documented in `README.md` §4a: opencode's
-session store is on NFS home and readable from every node, so `fleet code -s <id>` resumes on
-whichever node can serve it. The loss is the attach, not the work.
-
-**Ship P4a. It is a small diff against a proven script and it makes the fleet usable.**
-
-### 7.2 P4b — the srun stdio relay (the recommended real answer)
-
-The insight `DESIGN.md` §5.4 misses: the router does not have to open a cross-node socket, because
-`srun --overlap` already gives us a process on the backend's node with its stdin and stdout piped
-back to us. Slurm is the transport.
-
-```
-   client node                            backend node
-   ------------------------------         ---------------------------
-   opencode  ->  127.0.0.1:11600          (relay_remote.py)
-                 fleet-router  ----srun --overlap stdio---->  127.0.0.1:11500 ollama
-```
-
-`fleet-router` binds loopback on whatever node the *client* is on and speaks the OpenAI-compatible
-HTTP that opencode already talks to. Per backend it holds one long-lived
-`srun --jobid=<b> --overlap -n1 /usr/bin/python3.11 -u fleet/relay_remote.py` and exchanges
-length-prefixed frames over its stdio. The remote end makes the local HTTP call and streams frames
-back; SSE chunks become a frame sequence.
-
-Why this is the right shape:
-
-- **No listening socket on any network interface.** The PHI control in `README.md` §4 and §7.20 is
-  unchanged, not weakened. Nothing to authenticate because there is nothing to connect to.
-- **No SSH.** `README.md` §7.16: SSH between compute nodes is not reliable here, `srun --overlap`
-  is.
-- **The session survives a backend swap.** The router re-establishes the relay against the new
-  backend; opencode never notices its endpoint moved.
-- **One step per backend, not per request.** Step launch is paid once.
-
-Risks, all measurable in P0: step launch latency and reliability under load; stdio buffering (use
-`-u` and explicit flushes, never rely on line buffering through srun); the relay dying with the
-backend, which the router must detect and rebuild; and step accounting churn against slurmctld.
-
-**P4b exit criteria.** Median added latency under 100 ms on a short completion, measured against
-the same prompt run directly on the backend's node. A session that survives a deliberate `scancel`
-of its backend, with the fleet regrowing underneath it, and the user noticing only a pause.
-
-### 7.3 What we are NOT doing, and it needs to stay that way
-
-`DESIGN.md` §5.4 option C — bind backends to the node's cluster interface with a bearer token — is
-the conventional answer and it is a **deliberate weakening of the current PHI control**. It is not
-a config edit and the assistant does not get to make it. It is decision 1 in §11.
+**Quality is not free and the number is known.** GLM-5.2's int4 container measures **−8.2 percentage
+points** against the unquantized model, concentrated on the hardest questions, and 62.5 % mean
+`acc_norm` on a 0-shot multiple-choice harness. Whether a 744B model at int4 beats a well-served
+smaller model at 8-bit **for our tasks** is a blind side-by-side nobody has run. It remains owed
+(`DESIGN.md` §13) and the pivot makes it more important, not less.
 
 ---
 
-## 8. P5 — the second and third engines
+## 10. Build and tune
 
-Unchanged from `DESIGN.md` M0 and M2. Two additions from the live cluster:
+### 10.1 Build
 
-**vLLM** installs user-local into a conda prefix; `pypi.org` and `github.com` both answer from the
-login node, so nothing about the install is blocked. Run it as single-GPU replicas, not shards
-(`DESIGN.md` §4.2) — no NVLink, so tensor parallelism pays an all-reduce tax on every layer, and a
-replica can be surrendered one at a time where a four-GPU job cannot.
+```
+module load CUDA/13.1.0        # matches driver CUDA UMD 13.3; the build notes say 13.x
+module load GCC/13.3.0         # or the system gcc 13.3.0 already on PATH
+make -C c glm CUDA=1 CUDA_ARCH=sm_86 CUDA_HOME=$EBROOTCUDA ARCH=native
+```
 
-**colibrì has a resource shape nobody has costed yet.** `DESIGN.md` §4.1 puts it on one A40 with
-~500 GB of RAM. On this cluster, `MaxMemPerCPU=12000` (§2.2) means a 500 GB memory ask **drags at
-least 42 CPUs along with it** — nearly half a node's cores, for a job whose CPU work is real but
-nowhere near 42 cores' worth. That is precisely the ask that `DESIGN.md` §6.3 says schedules badly
-and blocks other people. Measure the actual RAM floor before committing to the placement, and
-expect the answer to change §4.1.
+- **`ARCH=native` is load-bearing, not a micro-optimisation.** The Makefile defaults to
+  `x86-64-v3`, which is AVX2. Our CPU has `avx512_vnni`, and colibrì selects a different int4
+  kernel family at compile time behind `#if defined(__AVX512VNNI__) && defined(__AVX512BW__)` — the
+  67.8 → 89.5 GB/s step in §3.4. Build without it and that measurement does not apply to us.
+- `CUDA_ARCH=sm_86` — A40 is compute capability 8.6.
+- No micromamba needed. colibrì's `BUILD-cuda-glibc241.md` recipe exists for hosts with no module
+  system; we have `CUDA/13.1.0`.
+- Build on a compute node, not the login node.
 
-Do not start P5 until P1–P4a are shipped and the fleet has run unattended for a week.
+### 10.2 The tuning protocol, which is mandatory and not optional
 
----
+**`.coli_usage` is a persistent learned routing profile that makes naive A/B benchmarking on this
+engine invalid.** colibrì's own report measured a byte-for-byte identical configuration at **5.46
+and then 2.56 tok/s** with no parameter changed, because the profile had re-tuned itself onto real
+usage between the two runs. A specialised profile is worth **≈ ×2**.
 
-## 9. Verify these before writing code (P0)
+Every measurement, without exception:
 
-Cheap, and every one of them can invalidate something above. A day, at most.
+```
+cp -f "$MODEL/.coli_usage" snapshot        # once, before the campaign
+# then before EVERY configuration:
+stop the backend; sleep 35                 # VRAM is not released immediately
+cp -f snapshot "$MODEL/.coli_usage"        # restore byte-for-byte
+start the backend; warm up on a fixed corpus; then measure
+```
 
-| # | test | what it settles |
+Two rules from the same report, each of which produced a published wrong claim: **never read
+cumulative log counters as current state** (count matching lines before and after the window and
+report the difference), and **never sample during a cold start** (loading takes minutes, during
+which GPU utilisation is legitimately 0 % and one layer may take 45 seconds — a sample there
+describes the loader, not the engine).
+
+### 10.3 The starting configuration
+
+Derived from §3, to be replaced by `coli tune`'s answer:
+
+| setting | value | why |
 |---|---|---|
-| 1 | Fill a `c3` node's CPUs with a tiny job, then submit a `c3_short` job needing the same CPUs. Watch for state `S`. | §2.1 — whether the preemption inference is real. **Submitting jobs touches a shared queue: confirm with the user first, keep it to one idle node and five minutes.** |
-| 2 | Read `AllocTRES` off a live `ollama_serve` job. | §2.2 — the real CPU cost of the current files |
-| 3 | Job A submits job B with `--dependency=afterany:$A`; `scancel` A; confirm B runs. | §5.2 — the chain |
-| 4 | `--signal=B:TERM@120` with a trap in the batch script. | §5.1 — whether the drain window exists |
-| 5 | Write a heartbeat on one node, read it from another; time the delay; read contents and mtime separately. | §6.1 — whether the heartbeat is trustworthy and by how much |
-| 6 | Time 20 `srun --jobid --overlap` step launches. | §7.2 — the relay's latency budget |
-| 7 | `scancel --signal=TERM` a running `ollama serve`; does it exit cleanly and finish an in-flight generation? | §6.3 — whether drain is possible at all |
-| 8 | `squeue` every 30 s for an hour from a compute node; watch for scheduler complaints or throttling. | §5.5 and `DESIGN.md` §14.8 |
+| `CUDA_DENSE` | `1` | ×2.8 on the reference host; the single most profitable flag, and undocumented |
+| `RAM_GB` | ~450 | the RAM budget is the lever that measurably paid (+25 %); we have 1 TB |
+| `PIN=stats PIN_GB=` | large | pin the hottest experts from the measured profile |
+| `XEXP` | `1` — **measure** | +11.6 % on 48 cores, neutral/negative on 24 |
+| `DIRECT`, `PIPE` | `1`, `1` | keep |
+| `URING`, `PILOT*` | **off** | +26 % once resident; they only burn the scarce CPU |
+| `CTX` | `131072` | four times the context for −23 % decode, prefill unchanged |
+| `COLI_PREFILL_CHUNK` | `2048` | at 512 the per-slice fixed costs dominate |
+| `KVSAVE` | `0` | PHI: no conversation state on shared storage |
+| `COLI_API_KEY` | set | closes `README.md` §7.20 |
+| `COLI_USAGE_DECAY` | on | without it a turn contributes 0.2 % against 18 M recorded selections and the profile stops tracking the workload |
+| `DRAFT` | measure | MTP speculation measured a **32 % loss** around 85 % expert hit; it must earn its keep |
 
-Record every result in this file under the relevant section, replacing the *inferred* labels with
-*measured* ones and the date. An unverified inference that has quietly become an assumption is how
-`DESIGN.md`'s own §14 traps get paid for twice.
-
----
-
-## 10. Documentation duties
-
-The repo's convention (`README.md` header, `DESIGN.md` preamble) is not optional and it is easy to
-skip when the code works:
-
-- **Durable facts graduate into `README.md`** when a phase is built *and verified* — not when it is
-  written. Architecture only: no results, no model-quality claims. Sizes, ports, walltimes and
-  resource asks belong there.
-- **Delete the corresponding entry from `DESIGN.md`** as each piece lands. That file documents what
-  is *intended*; leaving built things in it is how the two documents stop meaning anything.
-- **§2.1 goes into `README.md` §1 and §7 as soon as P0 test 1 settles it**, whether or not the fleet
-  ever ships. It is a live trap in advice the README currently gives.
-- **§2.2 corrects the CPU-ask argument in `README.md` §4** and the numbers in `DESIGN.md` §6.3.
-- **New traps go into `README.md` §7** in the existing voice: what happened, why it was invisible,
-  what the fix was.
-- **Commits carry no assistant attribution.** `.githooks/commit-msg` strips it, and
-  `AI_INSTRUCTIONS.md` §9 says never add it. The hook is the enforcement; the rule is the reason.
-- **Never push without being asked** (`AI_INSTRUCTIONS.md` §9). Offer, do not act.
+Run `coli plan --model <dir> --policy quality` first — it reports the planned tiers, the reason for
+each placement, the expected bottleneck, and a machine-readable `next_actions` list. Then `coli tune`
+for the OpenMP and NUMA sweep. Do not hand-tune past what those two produce without a controlled A/B.
 
 ---
 
-## 11. Decisions the user has to make
+## 11. Verify before writing code (P0)
 
-The assistant does not get to default these. Ask once, record the answer here with a date, and move
-on.
+| # | test | settles |
+|---|---|---|
+| 1 | Fill a `c3` node's CPUs, then submit a `c3_short` job needing them. Watch for state `S`. | §4 — whether `c3` preemption is real. **Touches a shared queue: confirm with the user first.** |
+| 2 | Build with `ARCH=native CUDA=1`; run colibrì's `AVX512 i4 selftest`. | §10.1 — that the VNNI kernel family compiles in |
+| 3 | Stage the 372 GB container; time the download and one cold load. | §1 — the 27-minute figure |
+| 4 | **Restart on the same node and time the second load.** | §4 — whether page cache kills most of the cold start |
+| 5 | `coli plan`, then `coli tune`, under the §10.2 protocol. | §3 — the real tok/s, and the NUMA and thread answers |
+| 6 | A/B `numactl --membind=0` (24c, local) against `COLI_NUMA=1` (48c, interleaved). | §3.6 — ours alone to answer |
+| 7 | A/B `XEXP=1`. | §3.4 — +11.6 % or negative |
+| 8 | Point Claude Code at `/v1/messages` with `COLI_API_KEY` set; run one tool call end to end. | §6 — the front door |
+| 9 | Job A submits B with `afterany`; cancel A; confirm B runs. `--signal=B:TERM@120` reaches a trap. | §5 — the chain |
+| 10 | Read `AllocTRES` on the real backend job. | §4 — what 500 GB actually costs in CPUs |
 
-1. **Does a non-PHI plane ever bind a network interface?** (`DESIGN.md` §5.4 option C.) The plan
-   says no and routes everything through §7.2's relay. Saying yes buys a conventional HTTP endpoint
-   and costs the strongest control we have. If yes, it needs the two-fleet split `DESIGN.md` §5.4
-   recommends — one router serving both planes is how they get confused.
-2. **How many of the six `c3` nodes may the fleet hold?** Plan proposes 2.
-3. **May the fleet book `c3_accel` on its own, or only on explicit request?** Plan proposes explicit
-   only, via `fleet up --big`, with a 10-minute idle release. compute306 is the only four-GPU node
-   and somebody else was on it while this was written.
-4. **Permanent supervisor, or idle-exit?** Plan proposes `idle_exit_minutes: 120` because of §2.3.
-   A truly permanent daemon is one config line and roughly doubles our recent-usage number.
-5. **Which model is the default fast tier?** Plan proposes `qwen3-coder:30b` — it fits one A40 with
-   room for a real context, and six nodes can serve it. A larger q8 model that still fits 46 GB is
-   a reasonable alternative and nobody has measured the trade here.
+Tests 3–7 are the campaign that decides whether this service is worth running. **Do them before any
+supervisor code.** The previous revision could build its control plane first because ollama was
+already proven; nothing here is.
 
 ---
 
-## 12. What "done" looks like
+## 12. Build order
 
-The user types `fleet code` on any node, including the login node, and gets a TUI against a local
-model in under a minute. They close the laptop. Overnight the fleet releases everything it holds and
-the supervisor exits. In the morning `fleet code` brings it back. If a colleague's GPU job goes
-pending on `Resources` at 2 p.m., the fleet drains a replica, gives the node back, and does not take
-it again until that job is running — and the log says so, with the job id, when anybody asks.
+| phase | what lands | exit criterion |
+|---|---|---|
+| **P0** | the ten tests above | a real tok/s number on our hardware, under the snapshot protocol |
+| **P1** | one hand-run colibrì backend, tuned | Claude Code completes a real coding task against it, with a tool call |
+| **P2** | the sbatch, the heartbeat, `fleet up` / `status` / `down` | one command brings it up and refuses to claim success before a token is generated |
+| **P3** | supervisor, chain, kill switch | survives two walltime rollovers; `fleet down` stops it and nothing restarts |
+| **P4** | idle release, caps, the yield ladder's one rung, hold-off | yields on a real `Resources` job and does not take the node back early |
+| **P5** | vLLM + the filesystem batch queue (§8) | a corpus pass completes with a worker killed mid-run and no item lost |
 
-Nothing in that paragraph requires an administrator, a login-node daemon, or a person watching.
-That is the whole deliverable, and it is achievable.
+**Stop after P1 and you already have the thing the user asked for**, run by hand. P2–P4 are what make
+it survive being left alone. P5 is a different project that happens to share a repository.
 
-What it is not is Fable on a leash. See §1.
+---
+
+## 13. Decisions that are yours
+
+1. **Partition.** `c3_short` (9 h, safe, 5 % duty lost to reloads) or `c3_accel` (7 d, no preemption,
+   but holds the cluster's only four-GPU node for a service that does not need four GPUs)? Plan says
+   `c3_short`, and says it reluctantly. Test 4 may make this easy.
+2. **Is ~92 CPUs and 500 GB on one of six nodes, continuously, acceptable?** That is the real ask
+   (§4). If not, the service does not exist in this form.
+3. **GLM-5.2 only, or measure DeepSeek V4 Flash first?** 13B active against 40B is a large potential
+   speed difference and the evidence for it is one unattributed number (§9).
+4. **Claude Code or opencode as the client?** colibrì speaks the Anthropic API natively, so Claude
+   Code works with three environment variables. Plan says Claude Code, opencode retained as fallback.
+5. **Is 6–12 tok/s acceptable for the work you have in mind?** If the intended use is an agent loop
+   rather than a consultant, the honest answer is that this service will not do it, and no
+   configuration in this document changes that.
+
+---
+
+## 14. Carried forward unchanged
+
+From the previous revision, still true and still load-bearing:
+
+- `c3` can `SIGSTOP` a server and the client sees silence, not an error (test 1).
+- Memory asks silently buy CPUs: `MaxMemPerCPU=12000`, and the minimum billable unit is two CPUs
+  because cores carry two threads (proven by job 2070710: asked `cpu=1`, got `cpu=2`).
+- Almost every pending job here is `BeginTime`, not `Resources`; the yield filter is the load-bearing
+  part.
+- Scrub `SLURM_*` before any nested `sbatch` — inherited variables **override the `#SBATCH`
+  directives in the file** (`README.md` §7.19).
+- Truncate a log before grepping it for readiness (`README.md` §7.17).
+- Never report success from a submission; success is a health check answering (`DESIGN.md` §7.4).
+- `config/fleet.json` needs a `!config/fleet.json` line in `.gitignore`, which ignores `*.json`.
+- Durable facts graduate into `README.md` when built **and verified**; the corresponding
+  `DESIGN.md` entry is deleted. Commits carry no assistant attribution. Never push unasked.
