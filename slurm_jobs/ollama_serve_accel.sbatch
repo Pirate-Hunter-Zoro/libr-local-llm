@@ -24,6 +24,22 @@ source ~/.bashrc
 # Set AFTER the source so it wins over anything .bashrc might define later.
 export OLLAMA_SCHED_SPREAD=1
 
+# Raise the context window for this profile only. ~/.bashrc sets 65536, which
+# has to be safe on ONE 46 GB card -- medgemma:27b-it-q8_0 is 29.6 GB of it
+# before any KV cache. Here there are four cards and gpt-oss:120b occupies
+# 70 GB of 184 GB, so ~114 GB sits idle; there is no reason to serve a 131072
+# model at half its window.
+#
+# The reason this matters for OUTPUT QUALITY, not just capacity: gpt-oss uses
+# sliding-window attention (128), and llama.cpp therefore logs "KV cache
+# shifting is not supported for this context, disabling KV cache shifting" at
+# startup. With shifting off and n_keep = 4, crossing the window has no graceful
+# path -- the prompt is truncated from the FRONT, which is where the system
+# prompt and the tool definitions live. An agent that has lost its tools still
+# answers; it just answers uselessly. A 55K-token coding session against a 65536
+# window was one exchange away from that, which is what prompted this.
+export OLLAMA_CONTEXT_LENGTH=131072
+
 if [ ! -d "$OLLAMA_MODELS" ]; then
     echo "OLLAMA_MODELS is unset or missing: '${OLLAMA_MODELS}'"
     exit 1

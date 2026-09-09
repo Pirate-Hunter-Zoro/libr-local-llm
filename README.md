@@ -238,7 +238,7 @@ A delimited `# >>> ollama >>>` block in `~/.bashrc` sets these. A backup of the 
 | `PATH` | **append** `$HOME/libr-local-llm/bin` | reach the driver commands (§4a). See below — this one has three constraints |
 | `OLLAMA_MODELS` | `/media/studies/.../models/ollama` | weights on studies, not the 100 GB home share |
 | `OLLAMA_HOST` | `127.0.0.1:11500` | non-default port avoids collisions on shared nodes; **loopback keeps a PHI-processing endpoint off the cluster network** |
-| `OLLAMA_CONTEXT_LENGTH` | `65536` | ollama defaults to a few thousand tokens; an agent silently truncates its own history there |
+| `OLLAMA_CONTEXT_LENGTH` | `65536` in `~/.bashrc`, **overridden to `131072` in the accel sbatch** | ollama defaults to a few thousand tokens; an agent silently truncates its own history there. 65536 is the number that has to be safe on *one* 46 GB card, where `medgemma:27b-it-q8_0` is 29.6 GB before any KV cache. The accel profile has four cards and 114 GB of them idle, so it serves `gpt-oss:120b` at the model's full 131072 — see §7.24 for why that is a *quality* setting and not just a capacity one |
 | `OLLAMA_KV_CACHE_TYPE` | `q8_0` | roughly halves long-context VRAM |
 | `OLLAMA_FLASH_ATTENTION` | `1` | same |
 | `OLLAMA_MAX_LOADED_MODELS` | `1` | qwen3-coder + medgemma = 48.2 GB, more than one A40 holds; evict cleanly |
@@ -664,6 +664,26 @@ Do not re-learn these.
     replaced with two single shifts: `shift 2` with one argument left **fails and shifts nothing**,
     and this function runs in an interactive shell where no `set -e` stops the loop, so a trailing
     bare `-s` would have spun forever.
+
+24. **A context window that is merely "large" still has a cliff at the edge, and the model falls off
+    it silently.** (Added 2026-09-09.) A 55K-token agentic coding session against a 65536 window
+    started returning empty and near-empty turns — 50 seconds of reasoning, then nothing worth
+    reading. That is not the model being stupid. `gpt-oss` uses sliding-window attention (128), so
+    llama.cpp logs **`KV cache shifting is not supported for this context, disabling KV cache
+    shifting`** at startup, and the slot runs with `n_keep = 4`. With shifting off and only four
+    tokens pinned, crossing the window has no graceful path: the prompt is truncated from the
+    **front**, which is exactly where the system prompt and the tool definitions live. An agent that
+    has lost its tools does not announce it. It keeps answering, uselessly, and the symptom reads as
+    a capability problem when it is a capacity one.
+    Three consequences worth separating. **The window was set too low for the hardware** — 65536 is
+    the number that must fit one 46 GB card, but the accel profile has four and 114 GB idle, so it
+    was serving a 131072-capable model at half its window for no reason; the accel sbatch now
+    overrides it. **A window is not a target.** Raising it to 131072 buys headroom, not quality at
+    100K: models degrade well before their nominal limit, so a fresh session per task still beats
+    growing one to 55K. And **check the serving numbers before blaming the weights** — the log had
+    the answer at line 271, before any argument about which model to run next.
+    Not yet verified against a running server: the override takes effect on the next `ollama-up
+    accel`, and it was not restarted while a live session depended on the resident model.
 
 ---
 
