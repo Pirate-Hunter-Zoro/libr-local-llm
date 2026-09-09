@@ -1,18 +1,34 @@
-# FLEET-BUILD.md — the build runbook for a tiered local inference service
+# FLEET-BUILD.md — the build runbook for a local inference service
 
 **Point a fresh session at this file.** It is the implementation plan for a local inference service
 on LIBR compute that several people can ssh into and work against from a VSCode terminal, with
 frontier-scale reasoning available when a question needs it.
 
-**Revised 2026-09-09, third pass.** Pass one planned a three-engine fleet with ollama as the daily
-driver; pass two replaced it with colibrì alone on one node. **Both were wrong about the shape.**
-Pass two also carried two factual errors, corrected in §2. The service is now **three tiers on
-different hardware**, because the bottleneck analysis in §3 says no single engine can be both fast
-for many people and deep for one.
+**Revised 2026-09-09, fourth pass.** Pass one planned a three-engine fleet with ollama as the daily
+driver; pass two replaced it with colibrì alone on one node; pass three split it into three fixed
+tiers. All three were wrong about the shape. The service is now **an elastic pool over 7 nodes and
+10 A40s** (§4): the everyday helper needs **one GPU of ten** and is therefore effectively never
+absent, a larger version appears on compute306 when that node has cards to spare, colibrì's 744B
+sits behind an explicit tool call, and batch work soaks up the rest. Pass two's two factual errors
+are corrected in §2; pass three's single point of failure is corrected in §4.1.
 
-Read first: [`AI_INSTRUCTIONS.md`](AI_INSTRUCTIONS.md), [`README.md`](README.md),
-[`DESIGN.md`](DESIGN.md). Plain-language walkthrough:
-[`docs/fleet_walkthrough.pdf`](docs/fleet_walkthrough.pdf).
+## Start here
+
+1. **Read, in order:** [`AI_INSTRUCTIONS.md`](AI_INSTRUCTIONS.md) (how to behave in this repo),
+   [`README.md`](README.md) (what exists), [`DESIGN.md`](DESIGN.md) (why the fleet is shaped this
+   way), then this file end to end. A plain-language walkthrough of the same system is
+   [`docs/fleet_walkthrough.pdf`](docs/fleet_walkthrough.pdf).
+2. **Get §13's decisions answered** before writing anything that depends on them. Most of the plan
+   does not, so this is not a blocker — but decisions 1 and 3 shape P1.
+3. **Run P0** (§9). It is a day, it comes first, and any one of its tests can invalidate a design
+   decision above it. **Test 10 submits jobs to a shared queue: confirm with the user before
+   running it.**
+4. **Then follow §12**, phase by phase, and do not start a phase whose predecessor's exit criterion
+   is unmet.
+5. **Graduate durable facts into `README.md`** as each piece is built *and verified*, deleting the
+   corresponding `DESIGN.md` entry. Commits carry no assistant attribution. Never push unasked.
+
+**Nothing in this file is built.** It is a work order, not a record of work.
 
 **No sudo, anywhere.**
 
