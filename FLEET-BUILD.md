@@ -26,9 +26,10 @@ it. That is close enough to the hosted experience that the difference is noticea
 disabling.
 
 **On what hardware:** an elastic pool over **7 nodes and 10 A40s** (§4), filled in priority order as
-GPUs come free and emptied in reverse as others need them. Six people do not need ten GPUs — one
-tier-1 instance absorbs them — so the rest go to the specialist and to batch corpus work, and eight
-of the ten release within seconds.
+GPUs come free and emptied in reverse as others need them. **The everyday helper needs one card of
+ten**, so it is effectively never absent; a larger version appears on compute306 when that node has
+cards to spare. Six people do not need ten GPUs, so the rest go to the specialist and to batch
+corpus work — and eight of the ten release within seconds.
 
 **What you cannot have:** the 744B model itself at conversational speed for everyone. §3.3 is the
 arithmetic and it is not a tuning problem — it is a property of top-8-of-256 expert routing.
@@ -197,37 +198,67 @@ Earlier revisions of this file talked as though the service were one or two fixe
 **It is a pool of ten independently allocatable GPUs, and the right design fills them when they are
 free and empties them when they are not.**
 
-### 4.1 What fits on one GPU, and what does not
-
-This is the constraint that shapes everything below.
+### 4.1 What fits, and the single point of failure that nearly got built in
 
 | | usable for weights | what that holds |
 |---|---|---|
-| **1× A40** (46 GB) | ~36 GB after KV cache | a ~70B model at int4, or ~30B at 8-bit |
-| **4× A40** (184 GB) | ~150 GB after KV cache | a **~250–300B MoE at int4** — the quality tier |
+| **1× A40** (46 GB) | ~36 GB after KV cache | a **~70B model at int4** |
+| 2× A40 | ~76 GB | ~150B MoE at int4 |
+| 3× A40 | ~114 GB | ~230B at int4 |
+| **4× A40** (184 GB) | ~150 GB | ~300B MoE at int4 |
 
-**No model spans nodes.** NVLink is inactive *within* compute306, and between nodes there is only
-40 Gb/s Ethernet — tensor parallelism over that is not a serious proposal. So compute306 is the only
-place the good model fits, and it fits exactly once.
+**No model spans nodes.** NVLink is inactive within compute306, and between nodes there is only
+40 Gb/s Ethernet. So multi-card models live on compute306 and nowhere else.
 
-### 4.2 Replication scales users, and does not scale speed
+> **The flaw in the previous revision.** It put tier 1 on compute306 with TP=4 and stopped there.
+> That makes the everyday helper — the thing everyone talks to — **depend on a single node**, and
+> worse than that, on *all four of its cards being free simultaneously*.
+>
+> **Read off the live cluster while writing this:** `compute306` is `State=MIXED` with
+> `AllocTRES=…,gres/gpu=1`. Another user holds **one** card. Three are free. **A TP=4 job would not
+> start today** — not because the node is busy, but because one card of four is taken. That is a
+> service that is absent for ordinary reasons, regularly.
 
-The distinction matters and it is easy to lose:
+**The good news buried in the same line: `c3_accel` allocates GPUs individually.** compute306 is not
+all-or-nothing. `--gres=gpu:2` on a node with three free cards works.
+
+### 4.2 The fix: the helper sizes itself to what it can get
+
+There are two distinct classes of everyday helper, and the design needs both:
+
+| class | weights | runs on | how many possible | availability |
+|---|---|---|---|---|
+| **standard** | ~36 GB, ~70B int4 | **any single card** | up to 10 replicas | needs 1 card of 10 — **effectively always** |
+| **large** | 76–150 GB | **compute306 only**, 2–4 cards | 1 | needs 2+ free cards on one contended node |
+
+**The standard helper is the floor and it is what `fleet` gives you by default.** It is never absent,
+because it needs one card out of ten and there is no realistic state of the cluster in which all ten
+are taken. Right now nine are free.
+
+**The large helper is an upgrade, not the service.** When compute306 has cards to spare, the fleet
+brings it up and the proxy routes callers to it; when it does not, nobody notices anything except
+slightly less capable answers. Same endpoint, same commands, no configuration.
+
+Three consequences worth stating:
+
+- **Availability beats peak quality for the default tier.** A helper that is sometimes missing is
+  worse than one that is always a bit weaker. This reverses the previous revision's priority.
+- **`fleet status` must name which helper answered**, or a quality change looks like the model
+  getting randomly worse.
+- **Capacity comes from replicas of the standard helper**, not from the large one. Ten single-card
+  replicas is a far more robust way to serve twenty people than one four-card instance.
+
+### 4.2a Replication scales users, and does not scale speed
 
 - **Batching** (several people through one model) failed on the giant model, for the union reason in
   §3.3.
-- **Replication** (several independent copies) has no union problem at all. Two replicas serve two
-  crowds at full speed each. It scales **linearly**, which batching never did.
-- **But a single user gets nothing from a second replica.** Ten GPUs do not make one answer faster.
-  They make more answers possible at once.
+- **Replication** (independent copies) has no union problem. It scales **linearly**.
+- **But a single user gets nothing from a second replica.** Ten GPUs do not make one answer faster;
+  they make more answers possible at once.
 
-**And for six people you do not need ten endpoints.** One vLLM instance with continuous batching on
-a VRAM-resident model serves tens of concurrent requests before per-user throughput degrades
-meaningfully — that is what the software is built for, and it is why tier 1 does not inherit the
-giant model's crowd problem. Replicas are the answer to *outgrowing* that, not to reaching it.
-
-So the other nine GPUs are not spare tier-1 capacity waiting to be switched on. They have better
-jobs, and the fleet should be taking them **when they are free** rather than leaving them idle.
+And for six people you do not need ten endpoints: one vLLM instance with continuous batching on a
+VRAM-resident model absorbs tens of concurrent requests before per-user throughput degrades. Replicas
+are the answer to *outgrowing* that, not to reaching it.
 
 ### 4.3 The pool, in priority order
 
@@ -236,12 +267,13 @@ empties them in exactly the reverse:
 
 | rank | what goes on the next free GPU | where | cost to start | cost to lose |
 |---|---|---|---|---|
-| **1** | **tier-1 primary** — the quality endpoint everyone talks to | compute306, TP=4 | minutes | the service |
-| **2** | **the specialist** — colibrì, GLM-5.2 744B | one `c3` node, +~500 GB RAM, ~92 CPUs | **27 min** | escalation only |
-| **3** | **tier-1 overflow replicas** — only when measured concurrency exceeds what the primary absorbs | `c3` nodes, 1 GPU each | minutes | a little capacity |
-| **4** | **batch workers** — corpus work off the filesystem queue | every remaining `c3` node | seconds | one work item |
+| **1** | **standard helper** — the floor; at least one must always exist | **any single card** | minutes | **the service** |
+| **2** | **large helper** — the upgrade, when compute306 has cards spare | compute306, 2–4 GPUs | minutes | better answers |
+| **3** | **the specialist** — colibrì, GLM-5.2 744B | one `c3` node, +~500 GB RAM, ~92 CPUs | **27 min** | escalation only |
+| **4** | **standard-helper replicas** — only when measured concurrency needs them | any single card | minutes | a little capacity |
+| **5** | **batch workers** — corpus work off the filesystem queue | every remaining card | seconds | one work item |
 
-**Yield order is the reverse: 4, then 3, then 2, then 1.** That is the ladder `DESIGN.md` §6.2 asked
+**Yield order is the reverse: 5, then 4, then 3, then 2 — and rank 1 last of all.** That is the ladder `DESIGN.md` §6.2 asked
 for, and it finally has more than one rung.
 
 Three properties fall out, and they are the whole answer to "is it OK to take everything?":
@@ -272,23 +304,27 @@ Elastic does not mean unlimited. The supervisor enforces, every cycle:
 `reserve_free_nodes` is new in this revision and it is the cheapest goodwill available: it costs one
 GPU of ten and it means a colleague's interactive job never waits on us at all.
 
-### 4.5 Tier-1 model selection — now a two-sided decision
+### 4.5 Model selection — now **two** models, and the small one matters more
 
-Requirement: fits 184 GB minus KV, MoE with ≲30B active, **tool calling**, strong at code, and int4
-(AWQ or GPTQ/Marlin — **Ampere has no FP8**). Selecting it is task one of P1.
+Both must support **tool calling**, be strong at code, and be int4 (AWQ or GPTQ/Marlin — **Ampere
+has no FP8**). Selecting them is task one of P1.
 
-The pool adds a second question that did not exist when tier 1 was one fixed box: **compute306 can
-be one big endpoint or four small ones.**
-
-| | one ~250B model, TP=4 | four ~36 GB replicas |
+| | **standard helper** | **large helper** |
 |---|---|---|
-| quality per answer | **higher** | lower |
-| endpoints | 1 (batching serves many) | 4 |
-| interconnect tax | an all-reduce every layer over PCIe | **none** |
+| budget | **≤36 GB** after KV | 76–150 GB |
+| runs on | any single card, 10 candidates | compute306 only |
+| priority | **choose this one first** | choose it second |
 
-For six users, quality wins and TP=4 is right. Past roughly twenty, capacity wins. **Do not build
-the switch yet** — measure both (§9 test 8) and pick one; a supervisor that reshapes compute306 on
-demand is the clever version, and the clever version is not v1.
+**Spend the selection effort on the standard helper.** It is what people will actually talk to,
+almost all the time, and its quality sets the floor of the whole service. The large helper is a
+bonus that appears when compute306 is quiet.
+
+Prefer the two from **one model family** if a family publishes both sizes. Same tokenizer, same
+chat template, same tool-call syntax, and a session that moves between them mid-conversation does
+not change behaviour in ways that read as the model breaking.
+
+**On compute306, still measure TP=2 versus TP=4 versus independent replicas** (§9 test 8) — no
+NVLink means every all-reduce crosses PCIe, and two 2-card instances may beat one 4-card one.
 
 ## 5. Cluster mode: real, and not yet ready
 
@@ -522,7 +558,8 @@ costs the scheduler nothing.
 | 5 | A/B `CUDA_DENSE=1` on one A40 | §3.4 — how much of the 122 ms the GPU takes |
 | 6 | **A/B one A40 against four** | §2.2 — the question pass two closed prematurely |
 | 7 | A/B `XEXP=1`, `numactl --membind=0` vs `COLI_NUMA=1`, MTP `DRAFT` depth | §3 — the remaining tier-2 levers |
-| 8 | vLLM tier 1: TP=4 against 2× TP=2, same model, aggregate tokens | §4.2 — the PCIe all-reduce tax |
+| 8 | vLLM: TP=4 vs 2× TP=2 vs independent single-card replicas | §4.5 — the PCIe all-reduce tax |
+| 8b | **the standard helper on one card, under 6 concurrent users** | §4.2 — whether the floor alone is good enough, which is the question that decides everything |
 | 9 | Tier 1 under 6 simulated concurrent users | the number this whole project is for |
 | 12 | **one real markdown-spec coding task end to end, per tier** — record turns, wall-clock, and **malformed tool calls** | §11.4 — whether "hand it a spec" is a workflow or a demo |
 | 10 | `c3` preemption: fill a node, submit a `c3_short` job, watch for state `S` | §12 — **touches a shared queue, confirm first** |
