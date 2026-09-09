@@ -31,3 +31,15 @@ node_modules/
 
 # live tutoring board (Tutor-Board) — scratch space, never tracked
 live/
+
+# ---- LaTeX build artifacts ----
+# docs/*.tex is the source and docs/*.pdf is the deliverable; everything
+# pdflatex writes alongside them regenerates on the next build.
+*.aux
+*.log
+*.nav
+*.out
+*.snm
+*.toc
+*.fls
+*.fdb_latexmk
