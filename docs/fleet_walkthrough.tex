@@ -243,6 +243,77 @@ variable is not --- which is exactly why helper 1 exists.}
 \end{frame}
 
 %----------------------------------------------------------
+\begin{frame}{How good is the specialist, really?}
+
+The honest answer depends entirely on \emph{what kind} of question you ask.
+
+\begin{center}
+\scriptsize
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}p{0.42\textwidth}p{0.26\textwidth}p{0.24\textwidth}@{}}
+\toprule
+\textbf{What you ask} & \textbf{Versus Claude} & \textbf{How long} \\
+\midrule
+``Here is a function and a bug report --- what is wrong?'' & \textbf{genuinely close} &
+1--4 minutes \\
+``Which of these two designs is better, and why?'' & \textbf{genuinely close} & 1--4 minutes \\
+``Read these eight files and find the inconsistency'' & \textbf{not close} & several minutes
+before it even starts \\
+``Keep working on this with me for an hour'' & \textbf{don't} & see the next slide \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.4em}
+\keybox{\small \textbf{One hard question, with everything it needs already in front of it.} That is
+what the specialist is for, and there it is worth the wait. When the job becomes ``hold a lot in
+your head and notice something subtle'', the gap opens wide.}
+
+\vspace{0.3em}
+{\small \textbf{An awkward twist:} the harder the question, the more it thinks before answering ---
+and thinking is what it is slow at. The questions most worth asking are the ones you wait longest
+for.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{``Can I just write down what I want and let it code?''}
+
+{\small Yes --- with the everyday helper, and with limits worth knowing first.}
+
+\begin{center}
+\scriptsize
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+\textbf{A moderate coding job, start to finish} & \textbf{How long} & \textbf{Sensible?} \\
+\midrule
+Claude, today & 3--5 minutes & yes \\
+\textbf{the everyday helper} & \textbf{6--12 minutes} & \textbf{yes} \\
+the specialist & about 30 minutes & no --- leave it alone \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.5em}
+\keybox{\small \textbf{Two to four times slower than Claude for the same job.} Write the
+description, start it, go and do something else for ten minutes. A real workflow, not a demo.}
+
+\vspace{0.3em}
+{\scriptsize \textbf{The catch is not about speed.} To edit your files the model fills in a little
+form for each action, and because we run a \emph{compressed} copy it \textbf{sometimes fills the
+form in wrong}. There is a built-in repair for the simple forms --- open a file, run a command ---
+but \textbf{not for the complicated ones}, and ``change this line to that line'' is a complicated
+one.}
+
+\vspace{0.3em}
+\goodbox{\scriptsize \textbf{Start with small, clearly described jobs and check the result.} How
+often it fills the form in wrong is one of the first things we measure --- if it is often, ``hand it
+a spec'' is a demo, and we want to know that early.}
+
+\end{frame}
+
+%----------------------------------------------------------
 \begin{frame}{What it looks like to use}
 
 \begin{center}

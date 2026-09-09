@@ -336,6 +336,7 @@ costs the scheduler nothing.
 | 7 | A/B `XEXP=1`, `numactl --membind=0` vs `COLI_NUMA=1`, MTP `DRAFT` depth | §3 — the remaining tier-2 levers |
 | 8 | vLLM tier 1: TP=4 against 2× TP=2, same model, aggregate tokens | §4.2 — the PCIe all-reduce tax |
 | 9 | Tier 1 under 6 simulated concurrent users | the number this whole project is for |
+| 12 | **one real markdown-spec coding task end to end, per tier** — record turns, wall-clock, and **malformed tool calls** | §11.4 — whether "hand it a spec" is a workflow or a demo |
 | 10 | `c3` preemption: fill a node, submit a `c3_short` job, watch for state `S` | §12 — **touches a shared queue, confirm first** |
 | 11 | Chain: job A submits B with `afterany`; cancel A; confirm B runs | the restart mechanism |
 
@@ -457,6 +458,83 @@ majority of the mechanical work — the shell probing, the LaTeX, the document d
 unlikely to produce findings 1 and 3 unprompted. That is not a reason to skip building it. **A
 system that does the routine 90 % and leaves your attention for the 10 % that is judgement is worth
 having**; it is a fast assistant that needs supervision, not a replacement for one.
+
+---
+
+### 11.4 Handing it a written spec: what an agent loop actually costs
+
+colibrì's own documentation carries a blunt warning about connecting agentic CLIs, and it needs
+both quoting and correcting:
+
+> *"A 15k-token agent preamble is **an hour of silent thinking** before the first output token…
+> iterative agent sessions against a disk-streaming 744B model do not resemble a hosted API and
+> mostly won't be worth the wait."*
+
+**That warning is for the disk-streaming configuration, which is precisely the one we are not
+running.** Its own numbers say so — "prefill runs at a few tokens per second", "roughly 1 tok/s for
+a large model". Our target is fully RAM-resident, where the same project measures **prefill at
+148–198 tok/s, flat across context lengths** and explicitly retracts the I/O-bound prefill claim:
+*"prefill is attention-bound, not I/O-bound."*
+
+Redone with resident numbers, for a coding agent's typical shape (15k-token system prompt and tool
+catalogue; ~500 output tokens and ~2k tokens of new tool results per turn):
+
+| | preamble, paid once | per turn | **30-turn task** |
+|---|---|---|---|
+| **tier 1** (vLLM, GPU-resident) | seconds | 12–25 s | **6–12 minutes** |
+| **tier 2** (colibrì, RAM-resident) | ~90 s | ~60 s | **~30 minutes** |
+| tier 2 as the warning describes it (disk-streaming) | **~1 hour** | minutes | unusable |
+| Claude, for reference | seconds | ~7 s | ~3–5 minutes |
+
+**So the answer is yes, on tier 1, at roughly two to four times the wall-clock.** The warning's
+conclusion still holds for tier 2 — never put an agent loop on the 744B — but for a factor-of-3
+reason, not a factor-of-40 one. Full residency is what separates the two rows, and it is the whole
+reason this design exists.
+
+**The constraint that is *not* about speed, and matters more:**
+
+> `COLI_TOOL_SALVAGE=1` — *"opt-in de-mangler: reconstruct a malformed int4 tool call by mapping its
+> lone payload onto the tool's primary parameter. Never rewrites well-formed output; **recommended
+> for int4 deployments**."*
+
+Read that carefully. A recovery path exists **because int4 GLM emits malformed tool calls often
+enough to need one**, and the recovery works by mapping a **lone payload onto one parameter**. That
+salvages `read(path)` and `bash(command)`. It cannot salvage `edit(file, old_string, new_string)` —
+a mangled multi-parameter call is simply lost.
+
+Consequences for the build:
+
+- **Turn `COLI_TOOL_SALVAGE=1` on**, always, on any int4 deployment.
+- **Prefer clients with few-parameter tools**, and expect edit-shaped tools to be the fragile ones.
+  A write-whole-file tool is more robust at int4 than a search-and-replace tool.
+- **Measure the tool-call failure rate before promising agentic work** — P0 test 12 below. A 5 %
+  malformation rate over 30 turns is a failed task more often than not.
+- `COLI_DEBUG=1` streams the model's output and `COLI_DEBUG=2` shows both sides; colibrì documents
+  both specifically for debugging an opencode session, so this path is trodden, not theoretical.
+
+**Add to §9:** *test 12 — run one real markdown-spec coding task end to end on each tier; record
+turns, wall-clock, and **the number of malformed tool calls**.* That last number decides whether
+"hand it a spec" is a supported workflow or a demo.
+
+### 11.5 The specialist against Claude, on the questions it exists for
+
+The only honest framing is by question shape, because the answer differs enormously.
+
+| question shape | how tier 2 compares | wall-clock |
+|---|---|---|
+| **self-contained hard question** — a function and a bug report, a design trade-off, "review this 200-line file" | **genuinely competitive.** A frontier-class open model, ~3 pp of quantization damage. The answer is worth the wait and will sometimes beat a fast model's | 1–4 min vs ~30 s |
+| **long context** — "read these eight files and find the inconsistency" | **not close.** Prefill at ~170 tok/s means a 50k-token context is five minutes before it starts, and decode falls 23 % from 32k to 131k | minutes before the first word |
+| **sustained multi-turn agent work** | **do not.** §11.4 | 30 min+ |
+| **knowing it is wrong** | **worst axis.** Calibration is poor in open models and worse at int4 — and int4 damage concentrates on hard questions, which is where you would want the warning | — |
+
+**The wall-clock penalty is largest exactly where the model is most valuable.** GLM-5.2 has a
+reasoning mode (`THINK=1`), and hard questions produce more reasoning tokens: 1,500 thinking plus
+500 answering at 10 tok/s is **3.3 minutes**. Claude does that in about 30 seconds. Reasoning depth
+is therefore a dial with a real price, not a free switch.
+
+**What tier 2 is for, concretely:** one hard question with its context already in the prompt, asked
+deliberately, answered in a minute or four. **What it is not for:** anything where you would
+otherwise be iterating.
 
 ---
 
