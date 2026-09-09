@@ -12,6 +12,17 @@
 #   ollama-code "explain this repo"      # one-shot prompt, no TUI
 #   ollama-code -m gpt-oss:120b "hi"     # pick the model explicitly
 #   ollama-code -k 2h                    # warm with a 2h hold and exit (pre-demo)
+#   ollama-code -l                       # list this directory's past sessions
+#   ollama-code -c                       # resume the most recent session here
+#   ollama-code -s ses_abc123            # resume one session by id
+#
+# Session selection exists here because bare `opencode -s <id>` is the trap it
+# looks like the cure for: the session store is fine, the endpoint is not. Both
+# live under ~/.local/share/opencode on NFS home, mounted on every node, so a
+# session started on one node is fully readable from the next -- but the client
+# still has to run beside the loopback socket, which is what this script does.
+# opencode scopes its session list to the PROJECT DIRECTORY, so -l and the TUI's
+# own picker show only sessions belonging to -d (default: the current directory).
 #
 # With no -m, the model already resident on the GPU is used. That is deliberate:
 # OLLAMA_MAX_LOADED_MODELS is 1, so naming a different model silently evicts the
@@ -36,6 +47,9 @@ MODEL=""
 WORKDIR="$PWD"
 KEEPALIVE=""
 PROFILE=""
+SESSION=""
+CONTINUE=""
+LIST_SESSIONS=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -43,8 +57,16 @@ while [ $# -gt 0 ]; do
         -d|--dir)       WORKDIR="$2"; shift 2 ;;
         -k|--keepalive) KEEPALIVE="$2"; shift 2 ;;
         -p|--profile)   PROFILE="$2"; shift 2 ;;
+        -s|--session)   SESSION="$2"; shift 2 ;;
+        -c|--continue)  CONTINUE=1; shift ;;
+        -l|--list-sessions) LIST_SESSIONS=1; shift ;;
         -h|--help)
-            echo "usage: ollama-code [-m model] [-d dir] [-k duration] [-p single|accel] [message...]"
+            echo "usage: ollama-code [-m model] [-d dir] [-k duration] [-p single|accel]"
+            echo "                   [-s session-id | -c] [-l] [message...]"
+            echo
+            echo "  -s, --session        resume this session id"
+            echo "  -c, --continue       resume the most recent session in -d"
+            echo "  -l, --list-sessions  list sessions in -d and exit (no server needed)"
             exit 0
             ;;
         --) shift; break ;;
@@ -52,6 +74,22 @@ while [ $# -gt 0 ]; do
     esac
 done
 MESSAGE="$*"
+
+# Listing sessions needs no model and no node: the store is on NFS home and only
+# the project directory scopes the list. Answer it here and stop, so this works
+# with nothing running at all -- which is when you most want to know what is
+# there. A login shell is used so nvm's PATH (and therefore opencode) exists;
+# `session` is on the opencode guard's passthrough list, so the function in
+# ~/.bashrc hands it straight to the real binary.
+if [ -n "$LIST_SESSIONS" ]; then
+    echo "Sessions in ${WORKDIR}:" >&2
+    exec bash -lc "cd $(printf '%q' "$WORKDIR"); opencode session list"
+fi
+
+if [ -n "$SESSION" ] && [ -n "$CONTINUE" ]; then
+    echo "-s and -c both choose a session; pass one or the other." >&2
+    exit 2
+fi
 
 # Find the server. Ask Slurm rather than reading a state file: a state file goes
 # stale the moment a job ends, squeue never does.
@@ -101,6 +139,34 @@ if [ -z "$MODEL" ]; then
     fi
 fi
 
+# Session flags are forwarded verbatim to opencode on the far node. The
+# invocation crosses a `bash -lc` string boundary, so everything interpolated
+# into it is quoted with printf %q: the far side is the same bash, so %q
+# round-trips exactly, and a directory or prompt containing a quote stops being
+# able to break the command apart.
+OC_ARGS=()
+[ -n "$SESSION" ]  && OC_ARGS+=(--session "$SESSION")
+[ -n "$CONTINUE" ] && OC_ARGS+=(--continue)
+
+# Resuming is the one case where -m is not the last word. Verified by launching
+# the TUI on the node with --print-logs against a session whose history was
+# qwen3-coder: the footer opened on the model -m named, then switched to the
+# session's own model once the history replayed. So a resumed session can carry a
+# model choice of its own, and on the accel profile that means the 70 GB
+# resident model is evicted the moment the first message is sent. Say so rather
+# than discovering it as a multi-minute stall.
+if { [ -n "$SESSION" ] || [ -n "$CONTINUE" ]; } && [ "$JOB_NAME" = "ollama_serve_accel" ]; then
+    echo "Note: a resumed session may carry its own model. If that model is not" >&2
+    echo "      ${MODEL}, the first message evicts it and reloads from scratch." >&2
+    echo "      Check the model shown in the TUI footer before sending." >&2
+fi
+
+Q_WORKDIR="$(printf '%q' "$WORKDIR")"
+Q_OC=""
+# Guarded on the count because printf runs its format once even with no
+# arguments, which would otherwise inject an empty quoted string.
+[ "${#OC_ARGS[@]}" -gt 0 ] && Q_OC="$(printf '%q ' "${OC_ARGS[@]}")"
+
 # Optional pre-warm. --keepalive is PER REQUEST: every later call that omits it
 # -- and opencode omits it on every call -- resets the hold to OLLAMA_KEEP_ALIVE
 # (20m). Use this before a demo so the load cost is paid up front.
@@ -118,9 +184,17 @@ fi
 if [ -n "$MESSAGE" ]; then
     # One-shot. No TUI, so no pty needed.
     srun_on_server --quiet bash -lc \
-        "source ~/.bashrc; cd '${WORKDIR}'; opencode run -m 'ollama/${MODEL}' -- '${MESSAGE}'"
+        "source ~/.bashrc; cd ${Q_WORKDIR}; opencode run -m $(printf '%q' "ollama/${MODEL}") ${Q_OC}-- $(printf '%q' "${MESSAGE}")"
 else
     # TUI. --pty is what makes the terminal interactive through Slurm.
+    #
+    # The model is passed here too, which it did not used to be. opencode's
+    # default (TUI) command does accept --model as of 1.18.x, and without it the
+    # TUI takes config/opencode.json's default -- qwen3-coder:30b. On the accel
+    # server that is an eviction: OLLAMA_MAX_LOADED_MODELS is 1, so opening the
+    # TUI beside a resident gpt-oss:120b would unload 70 GB and reload from
+    # scratch, which is the exact failure the resident-model adoption above
+    # exists to prevent. Passing it makes the TUI agree with the one-shot path.
     srun_on_server --quiet --pty bash -lc \
-        "source ~/.bashrc; cd '${WORKDIR}'; opencode"
+        "source ~/.bashrc; cd ${Q_WORKDIR}; opencode -m $(printf '%q' "ollama/${MODEL}") ${Q_OC}"
 fi

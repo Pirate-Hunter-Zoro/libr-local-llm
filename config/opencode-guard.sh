@@ -41,9 +41,19 @@ opencode() {
     # 2. Subcommands that read config, credentials or local state and never
     #    touch the model endpoint. These are the ones README section 6 asks you
     #    to run for verification, so they must work from the login node.
+    #
+    #    This list used to end in `-*`, which was wrong and is the second way
+    #    this fence got walked through. `-*` was meant for --help and --version.
+    #    But opencode's session, model, prompt, agent and mini flags are options
+    #    on the DEFAULT command -- they start the TUI -- so `opencode -s <id>`
+    #    matched `-*`, was handed to the real binary, and failed with the same
+    #    contentless unreachable-API error this file exists to replace. Only the
+    #    two flags that genuinely print and exit are listed now; everything else
+    #    beginning with a dash falls through to the endpoint probe below.
     case "$sub" in
         completion|mcp|providers|auth|agent|upgrade|uninstall|models|stats|\
-        export|import|github|session|plugin|plug|db|debug|-*)
+        export|import|github|session|plugin|plug|db|debug|\
+        -h|--help|-v|--version)
             command opencode "$@"
             return
             ;;
@@ -76,18 +86,50 @@ opencode() {
         done
     fi
 
+    # Session selection is the case worth handling by hand rather than pointing
+    # at the manual: someone reaching for `opencode -s <id>` has a specific
+    # session in mind, and ollama-code takes the same flags, so the corrected
+    # line can be the one they actually wanted instead of a generic example.
+    #
+    #    The shifts are deliberately one-at-a-time. `shift 2` with a single
+    #    argument left FAILS and shifts nothing, and this function runs in the
+    #    user's interactive shell where no `set -e` will stop the loop -- so a
+    #    trailing bare `-s` would spin forever. Shifting the flag, then the value
+    #    only if one is there, cannot do that.
+    local fwd=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -s|--session)
+                shift
+                if [ $# -gt 0 ]; then fwd+=(--session "$1"); shift; fi
+                ;;
+            -c|--continue) fwd+=(--continue); shift ;;
+            *) shift ;;
+        esac
+    done
+
     if [ -n "$job" ]; then
         node="$(squeue -j "$job" -h -o '%N' 2>/dev/null)"
         printf 'A server IS up: %s job %s on %s.\n' "$name" "$job" "${node:-?}" >&2
         printf 'Its endpoint is loopback-only on that node, so a client here cannot\n' >&2
         printf 'reach it. Step into the allocation instead of running opencode direct:\n\n' >&2
-        printf '    ollama-code                     # TUI, current directory\n' >&2
-        printf '    ollama-code "your prompt"       # one-shot, no TUI\n' >&2
+        if [ "${#fwd[@]}" -gt 0 ]; then
+            printf '    ollama-code %s\n\n' "${fwd[*]}" >&2
+            printf 'The session store is on NFS home and readable from every node, so\n' >&2
+            printf 'that session is intact -- it was only ever the endpoint that was not\n' >&2
+            printf 'here. Add -d <project-dir> if you are not in the session%ss directory;\n' "'" >&2
+            printf 'opencode scopes sessions per project. `ollama-code -l` lists them.\n' >&2
+        else
+            printf '    ollama-code                     # TUI, current directory\n' >&2
+            printf '    ollama-code -l                  # list this directory'"'"'s sessions\n' >&2
+            printf '    ollama-code "your prompt"       # one-shot, no TUI\n' >&2
+        fi
     else
         printf 'No Ollama server is running. Start one, then connect:\n\n' >&2
         printf '    ollama-up            # 1 GPU, c3_short  (qwen3-coder, medgemma)\n' >&2
         printf '    ollama-up accel      # 4 GPUs, c3_accel (gpt-oss:120b)\n' >&2
         printf '    ollama-code          # then this, from anywhere\n' >&2
+        printf '\n(`ollama-code -l` lists past sessions and needs no server at all.)\n' >&2
     fi
 
     printf '\n(Deliberate bypass, if you know the endpoint is local: command opencode)\n' >&2

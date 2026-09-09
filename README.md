@@ -399,7 +399,7 @@ goes stale the moment a job ends or a second one is submitted; `squeue` never do
 | Command | Does |
 | --- | --- |
 | `ollama-up [single\|accel] [hours]` | Submits the matching sbatch, waits for `RUNNING`, asserts `AllocTRES` contains `gres/gpu=`, waits for `Listening on` in the stderr log. Exits non-zero unless the server is actually serving. Optional walltime in hours overrides the file's 8 h. Reports the pending reason while it waits, and leaves the job queued if it gives up. |
-| `ollama-code [-m model] [-d dir] [-k dur] [-p single\|accel] [message…]` | Finds the running server and launches opencode on its node. No message → the TUI. A message → a one-shot `opencode run`. |
+| `ollama-code [-m model] [-d dir] [-k dur] [-p single\|accel] [-s id \| -c] [-l] [message…]` | Finds the running server and launches opencode on its node. No message → the TUI. A message → a one-shot `opencode run`. `-s` resumes one session by id, `-c` resumes the most recent one in `-d`, `-l` lists what that directory has and exits without needing a server. |
 | `ollama-down [all\|single\|accel]` | Cancels the server jobs. Run it when done — compute306 is the only 4-GPU node. |
 
 Behaviors worth knowing:
@@ -418,6 +418,21 @@ Behaviors worth knowing:
   captures the job id via `sbatch --parsable` rather than parsing "Submitted batch job N".
 - **Both scripts scrub `SLURM_*` before shelling out**, which is what lets them run from inside
   another allocation. See trap §7.19 — this is not defensive garnish, the unscrubbed version fails.
+- **Past sessions are reachable from any node, and `-s` / `-c` / `-l` are how you reach them.**
+  (Added 2026-09-09.) opencode's session store is under `~/.local/share/opencode` on NFS home,
+  mounted on every node, so a session started on compute306 is fully readable from wherever you
+  next log in. Only the *endpoint* was ever node-bound. What that means in practice: nothing is
+  lost when an allocation ends, and `ollama-code -s <id>` resumes on the node that can actually
+  serve it. `-l` answers without a server at all, since listing touches only the store.
+  opencode scopes sessions **per project directory**, so `-l` and the TUI's own picker show only
+  what belongs to `-d` (default: the current directory) — a session started in one repo is
+  invisible from another, which looks like data loss and is not.
+- **A resumed session can override `-m` and evict the resident model.** (Added 2026-09-09.)
+  Verified by launching the TUI on the node with `--print-logs` against a session whose history
+  was qwen3-coder: the footer opened on the model `-m` named, then switched to the session's own
+  model once the history replayed. On the accel profile that is a 70 GB eviction on the first
+  message. `ollama-code` prints a warning when resuming there; the TUI footer is the thing to
+  read before sending.
 - **Typing `opencode` instead of `ollama-code` is caught, not punished.** A shell function sourced
   from `~/.bashrc` (§3) answers a bare `opencode` with which node the server is on, or with the
   `ollama-up` lines if none is. It exists because the wrong command produced an unreachable-API
@@ -632,6 +647,24 @@ Do not re-learn these.
     connection failure carries no diagnosis. `config/opencode-guard.sh` (§3) closes both by
     intercepting the `ollama-*` names and by naming the serving node before handing over.
 
+23. **A passthrough list ending in `-*` is not a passthrough list, it is a hole.** (Added
+    2026-09-09.) The guard from §7.22 had a second case listing the subcommands that need no model
+    endpoint — `models`, `agent`, `session` and so on — so that §6's verification steps still work
+    from the login node. That list ended in `-*`, meant for `--help` and `--version`. But opencode's
+    `--session`, `--continue`, `--model`, `--prompt`, `--agent` and `--mini` are options on the
+    **default** command, which is the TUI: they need the endpoint as much as a bare `opencode` does.
+    So `opencode -s <id>` matched `-*`, was handed to the real binary, and produced exactly the
+    contentless *"Cannot connect to API"* that the guard exists to replace — from a shell where the
+    guard was correctly installed and loaded. A fence with a wildcard in it protects nothing it did
+    not enumerate. Only `-h`/`--help`/`-v`/`--version` are listed now; every other dash argument
+    falls through to the endpoint probe.
+    Two things fell out of fixing it. The guard now forwards the session flags it saw into the
+    corrected `ollama-code` line, because someone typing `-s <id>` has a specific session in mind
+    and a generic example is not an answer. And the `shift 2` used to consume a flag's value was
+    replaced with two single shifts: `shift 2` with one argument left **fails and shifts nothing**,
+    and this function runs in an interactive shell where no `set -e` stops the loop, so a trailing
+    bare `-s` would have spun forever.
+
 ---
 
 ## 8. Not done yet
@@ -689,11 +722,14 @@ Do not re-learn these.
 - **Walltime.** Both sbatch files default to 8 h. `c3` and `c3_accel` allow up to 7 days if a
   longer-lived server is wanted; `ollama-up` takes an hours argument for shorter ones, which is the
   right choice on `c3_accel` since compute306 is the only 4-GPU node.
-- **`ollama-code` cannot pick the model for the TUI.** opencode's `--model` flag exists on its `run`
-  subcommand but not on the bare TUI invocation, so `-m` only takes effect for one-shot prompts. In
-  the TUI you get `config/opencode.json`'s default and change it from the in-app picker. Making `-m`
-  work there means writing the default into the config before launching, which is a config mutation
-  and has not been done.
+
+**`ollama-code` cannot pick the model for the TUI** also used to live here, on the grounds that
+opencode's `--model` existed on `run` but not on the bare TUI invocation. That is no longer true of
+opencode 1.18.x, where `--model` is a top-level option, so `ollama-code` now passes the adopted
+model to the TUI as well as to one-shots — which matters because the config default is
+`qwen3-coder:30b` and the TUI was therefore one keystroke from evicting a resident `gpt-oss:120b`.
+No config mutation was needed after all. The caveat that replaced it is in §4a: a *resumed* session
+can still carry its own model and override the flag.
 
 The 4-GPU shard and one-command serving both used to live in this section. They are done (§4, §4a);
 the shard verification says the multi-GPU path on this hardware is sound, which is worth having
