@@ -89,7 +89,7 @@ while answering you.}
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{Why it is slow: 600 trips to the shelf, per word}
+\begin{frame}{Why it is slow: 600 books to carry, per word}
 
 Here is the whole speed problem, and there is no trick that makes it go away.
 
@@ -108,50 +108,52 @@ Here is the whole speed problem, and there is no trick that makes it go away.
 \end{center}
 
 \vspace{0.6em}
-\keybox{\Large 75 floors $\times$ 8 books = \textbf{600 book-fetches for every single word.}}
+\keybox{\Large 75 floors $\times$ 8 books = \textbf{600 books to carry, for every single word.}}
 
-\vspace{0.8em}
-Everything about the design comes from trying to make those 600 trips faster. We can shorten the
-walk. We can put the most-used books nearer. We \textbf{cannot} avoid the trips --- that is simply
-how this kind of model works.
+\vspace{0.7em}
+\textbf{The cost is the carrying, not the walking.} The books are heavy and there are 600 of them
+per word. Shortening the walk barely helps. \textbf{Remember this} --- it is the reason the obvious
+speed-up on the next slide does not work.
 
 \vspace{0.6em}
-{\small And the fetching is only \emph{half} the work. The other half is the thinking it does once
-it has the books. Even if we made the fetching instant, we would only be about \textbf{twice} as
-fast. Worth knowing before anyone promises ten times.}
+{\small And the carrying is only \emph{half} the work. The other half is the thinking it does once
+it has the books. Even if carrying were instant we would only be about \textbf{twice} as fast.
+Worth knowing before anyone promises ten times.}
 
 \end{frame}
 
 %----------------------------------------------------------
 \begin{frame}{The obvious fix that does not work}
 
-{\small \textbf{The obvious idea:} if eight people ask at the same time, fetch everyone's books in
-\emph{one} trip. Serve eight for the price of one. It fails, and the reason is simple:}
+{\small \textbf{The obvious idea:} eight people ask at once, so make \emph{one} trip instead of
+eight. Eight people for the price of one.}
 
-\keybox{\small \textbf{Eight people want eight \emph{different} sets of books.} One trip for 8 books
-becomes one trip for about \textbf{57} --- and you are still only serving eight people.}
+\keybox{\small \textbf{The catch: eight people want eight \emph{different} sets of books.} You still
+carry almost all of them. You saved the walking --- and the walking was never the cost.}
 
 \vspace{0.4em}
 \begin{center}
-\small
-\begin{tabular}{@{}rrl@{}}
+\scriptsize
+\begin{tabular}{@{}lrrr@{}}
 \toprule
-\textbf{People at once} & \textbf{Books to fetch} & \\
+& \textbf{trips} & \textbf{books carried} & \textbf{books \emph{per person}} \\
 \midrule
-1 & 8 & \\
-4 & 33 & barely better than doing them one by one \\
-8 & 57 & \\
+one person, alone & 1 & 8 & \textbf{8.0} \\
+eight people, one after another & 8 & \textbf{64} & \textbf{8.0} \\
+\textbf{eight people, all in one trip} & \textbf{1} & \textbf{57} & \textbf{7.2} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \vspace{0.4em}
-{\small \textbf{This was actually tested}, not guessed. With eight people the group finished no
-faster in total --- and each person waited \textbf{about five times longer} than going alone.}
+{\small You hoped the cost per person would fall from 8 books to 1. \textbf{It falls from 8.0 to
+7.2} --- a few people want the same book, but with 19,000 to choose from, only a few.
+\textbf{Measured, not guessed:} eight at once did about \textbf{1.7$\times$} the work in total, and
+each waited about \textbf{five times longer} for their own answer.}
 
-\vspace{0.4em}
+\vspace{0.2em}
 \goodbox{\small \textbf{The conclusion:} a giant model cannot serve a crowd quickly. For a crowd you
-need a \textbf{smaller} model. That is why we build more than one.}
+need a \textbf{smaller} model --- which is why we build more than one.}
 
 \end{frame}
 

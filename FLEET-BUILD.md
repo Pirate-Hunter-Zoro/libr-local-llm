@@ -109,14 +109,15 @@ GLM-5.2 routes **top-8 of 256** experts per layer. Processing B tokens in one fo
 ```
 E[distinct experts] = 256 × (1 − (1 − 8/256)^B)
 
-B =  1  →   8.0 experts   (1.0× the bytes,  1 token)
-B =  5  →  37.6           (4.7× the bytes, ≤5 tokens)
-B =  8  →  57.4           (7.2× the bytes,  8 tokens)
-B = 16  →  99.5           (12.4× the bytes, 16 tokens)
+B =  1  →   8.0 experts   (1.0× the bytes,  1 token)   → 8.00 experts per token
+B =  4  →  30.5           (3.8× the bytes,  4 tokens)  → 7.63 per token
+B =  8  →  57.4           (7.2× the bytes,  8 tokens)  → 7.18 per token
+B = 16  → 102.0           (12.7× the bytes, 16 tokens) → 6.37 per token
 ```
 
-**The union grows almost linearly with the batch.** Expert bytes per token barely fall, so the 43 %
-half of the budget does not amortise. Only the 57 % half does.
+**The union grows almost linearly with the batch, so expert bytes per token barely fall** — 8.00 →
+7.18 at eight-way batching, where the hope was 8.00 → 1.00. The 43 % half of the budget does not
+amortise. Only the 57 % half does.
 
 Working it through at `KV_SLOTS=8` predicts ~10 tok/s aggregate and ~1.25 tok/s each. **colibrì
 ran that experiment under full residency and the prediction holds**
