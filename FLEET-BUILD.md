@@ -104,6 +104,42 @@ ordering is the opposite of picking "the biggest thing that fits", which is the 
 
 The same rule governs the large helper on compute306, with a bigger budget.
 
+### 0.5 The API key: there is nothing to obtain
+
+**Nobody issues this key. You invent it.** It is a shared secret between our server and our clients,
+like choosing a password — no vendor, no signup, no cost, no account. Two separate things get called
+a key and only one is real (§6.2):
+
+- **`ANTHROPIC_API_KEY=local`** — a dummy word that exists only because the client refuses to start
+  with the variable empty. Not a credential. Never checked by anyone.
+- **`COLI_API_KEY` / vLLM's `--api-key`** — **ours, chosen by us, enforced by our server.**
+
+Generate one, once, entirely in user space:
+
+```
+mkdir -p ~/.config/fleet
+umask 077
+openssl rand -hex 32 > ~/.config/fleet/api_key
+chmod 600 ~/.config/fleet/api_key
+```
+
+Three rules about where it lives:
+
+1. **Not in this repository.** It is public (`README.md` header). `~/.config/fleet/` is outside the
+   repo entirely, which is better than gitignoring it.
+2. **Not in the sbatch files, not on a command line.** Slurm scripts are readable and `ps` is
+   readable by other users on a shared node. The backend reads the file; the launcher never echoes
+   it.
+3. **`chmod 600` is necessary and its enforcement is unverified here.** `PERMISSIONS.md` records the
+   finding: this home is NFSv4 on an Isilon, access is decided by an NFSv4 ACL, and **the POSIX mode
+   the client shows is a lossy synthesis of that ACL rather than the thing being enforced** — and
+   the home's own ACL cannot be read from this account because `nfs4_getfacl` is not installed. So
+   set the mode, and treat the key as *protected but not proven protected*. Rotating it is one
+   command; do that rather than assuming.
+
+**None of this is needed before P0 or P1.** The key first matters in P2, when a backend binds the
+cluster interface. A fresh session generates it at that point; there is nothing to prepare.
+
 ---
 
 ## 1. The verdict
@@ -708,7 +744,7 @@ as current state. Never sample during a cold start.
 Starting configuration, to be replaced by `coli tune`: `CUDA_DENSE=1`, `RAM_GB≈450`, `PIN=stats`
 with a large `PIN_GB`, `XEXP=1` (measure), `DIRECT=1 PIPE=1`, **`URING` and `PILOT*` off** (+26 %
 once resident — they only burn the scarce CPU), `CTX=131072`, `COLI_PREFILL_CHUNK=2048`,
-`KVSAVE=0`, `COLI_API_KEY` set (§6.2), `COLI_USAGE_DECAY` on, `KV_SLOTS=1` with `DRAFT` measured.
+`KVSAVE=0`, `COLI_API_KEY` set from `~/.config/fleet/api_key` (§0.5), `COLI_USAGE_DECAY` on, `KV_SLOTS=1` with `DRAFT` measured.
 
 ---
 
