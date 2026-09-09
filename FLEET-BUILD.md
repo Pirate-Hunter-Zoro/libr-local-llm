@@ -18,11 +18,11 @@ are corrected in §2; pass three's single point of failure is corrected in §4.1
    [`README.md`](README.md) (what exists), [`DESIGN.md`](DESIGN.md) (why the fleet is shaped this
    way), then this file end to end. A plain-language walkthrough of the same system is
    [`docs/fleet_walkthrough.pdf`](docs/fleet_walkthrough.pdf).
-2. **Get §13's decisions answered** before writing anything that depends on them. Most of the plan
-   does not, so this is not a blocker — but decisions 1 and 3 shape P1.
+2. **Read §0 and obey it.** The user's standing instructions: queue tests are pre-authorised,
+   **everything must die to `scancel -u $USER`**, and the P1-shaping decisions are already made in
+   favour of performance. Do not re-ask them.
 3. **Run P0** (§9). It is a day, it comes first, and any one of its tests can invalidate a design
-   decision above it. **Test 10 submits jobs to a shared queue: confirm with the user before
-   running it.**
+   decision above it. **No confirmation needed — §0.1 covers it.**
 4. **Then follow §12**, phase by phase, and do not start a phase whose predecessor's exit criterion
    is unmet.
 5. **Graduate durable facts into `README.md`** as each piece is built *and verified*, deleting the
@@ -31,6 +31,78 @@ are corrected in §2; pass three's single point of failure is corrected in §4.1
 **Nothing in this file is built.** It is a work order, not a record of work.
 
 **No sudo, anywhere.**
+
+---
+
+## 0. Standing instructions from the user (2026-09-09)
+
+These are decided. Do not re-ask them; do not re-litigate them. Later sections that read as open
+questions have been updated, but if any residual text disagrees with this section, **this section
+wins.**
+
+### 0.1 Queue-touching tests are pre-authorised
+
+**Test 10 (`c3` preemption) is approved.** Run it without asking again. It fills one idle node's
+CPUs with a short job, submits a competing `c3_short` job, and watches for state `S`. Keep it to one
+node and five minutes, prefer a node already `idle`, and cancel both jobs the moment the answer is
+in either direction.
+
+That authorisation covers **P0 as written** — submitting the fleet's own jobs, timing loads,
+running `coli tune`. It does **not** extend to anything that would sit on a node for hours during
+working time; if a test grows into that, ask.
+
+### 0.2 Everything must die to `scancel -u $USER`
+
+**The hard constraint.** Every persistent component is a Slurm job owned by the user. Nothing else
+runs in the background, anywhere, ever.
+
+| | status |
+|---|---|
+| supervisor, backends, batch workers | **Slurm jobs** — `scancel` reaches all of them |
+| the pending successor in the restart chain | **a Slurm job**, cancelled by the same sweep |
+| the local proxy (§6.1) | **a foreground child of the `fleet` command**, dies with your terminal. Not a daemon, holds nothing |
+| ~~systemd `--user` timer~~ | **removed.** §8 — a systemd unit is not a Slurm job |
+| anything on a login node | **forbidden**, beyond a short-lived client process |
+
+**Two consequences that changed the design**, both in §8: the backstop timer is gone, and the
+supervisor now **writes `STOP` when it receives a `SIGTERM` that is not a walltime handoff** — so
+`scancel` stops the fleet instead of triggering its restart chain.
+
+> **`scancel -u $USER` is the emergency stop and it works completely.** It is a bigger hammer than
+> `fleet down` — it also kills your own interactive jobs — but nothing survives it.
+
+**No sudo, anywhere, at any step.**
+
+### 0.3 Decisions made on the user's instruction: maximise performance
+
+The user delegated the P1-shaping decisions with one instruction: **maximise performance.** These
+are now settled.
+
+| # | decision | ruling | why |
+|---|---|---|---|
+| 1 | does the everyday helper bind the cluster network? | **yes**, with an API key | loopback serves one node and one user, which defeats the entire point. Recorded as a deliberate weakening of the control in `README.md` §7.20. **The batch tier stays socket-free** (§8 of `DESIGN.md`), so the PHI corpus path is unaffected |
+| 2 | which model shape for the standard helper? | **a sparse MoE, ≤36 GB at int4, with ≤10B active parameters** | §0.4 — this is the single highest-leverage performance decision available and it is not a close call |
+| 3 | tensor parallelism on compute306 | **the minimum that fits, never more.** TP=2 before TP=4; independent single-card replicas before either | NVLink is inactive, so every all-reduce crosses PCIe. Extra cards past what the weights need are a tax, not a speed-up |
+| 4 | partition | **`c3_short` for everything**, longevity from the restart chain | `c3` is preemptible and a suspended server hangs the client with no error (§14). 27 min of reload per 9 h is 5 %; a silent freeze is unbounded |
+| 5 | colibrì settings | `CUDA_DENSE=1`, `XEXP=1`, speculation on at `KV_SLOTS=1`, `URING`/`PILOT*` **off** | §10. Each is a measured lever; `XEXP` and speculation are still A/B'd in P0, but they ship **on** unless a measurement says otherwise |
+| 6 | `reserve_free_nodes` | **stays at 1** | it costs one card of ten and it is the only reason a colleague never waits on us at all. Performance for us is not worth being the group that gets emailed |
+
+### 0.4 The one decision that matters most for speed: sparse, not dense
+
+A single A40 reads at roughly 700 GB/s. Time per word is *bytes read* over that number, so **what
+matters is not how big the model is — it is how much of it is read per word.**
+
+| standard helper, same 36 GB on disk | bytes read per word | rough speed |
+|---|---|---|
+| **dense ~70B at int4** | the whole 36 GB | **~19 tok/s** |
+| **sparse MoE, ~10B active** | ~5 GB | **~3–4× faster** |
+| **sparse MoE, ~3B active** | ~1.5 GB | **faster still, compute-bound rather than read-bound** |
+
+Same footprint, same card, several times the speed. **So the selection rule is: among models that
+fit, take the one with the fewest active parameters that still meets the quality bar** — and that
+ordering is the opposite of picking "the biggest thing that fits", which is the instinct to resist.
+
+The same rule governs the large helper on compute306, with a bigger budget.
 
 ---
 
@@ -328,8 +400,13 @@ has no FP8**). Selecting them is task one of P1.
 | | **standard helper** | **large helper** |
 |---|---|---|
 | budget | **≤36 GB** after KV | 76–150 GB |
+| **architecture** | **sparse MoE, ≤10B active** (§0.4) | sparse MoE |
 | runs on | any single card, 10 candidates | compute306 only |
 | priority | **choose this one first** | choose it second |
+
+**Among models that fit, take the one with the fewest active parameters that clears the quality
+bar** (§0.4). Active parameters, not total size, set the speed — a dense 70B and a sparse MoE of the
+same footprint differ by 3–4× on the same card.
 
 **Spend the selection effort on the standard helper.** It is what people will actually talk to,
 almost all the time, and its quality sets the floor of the whole service. The large helper is a
@@ -406,8 +483,8 @@ Tier 1 binds the cluster network (it must, to serve more than one node), so its 
 is precisely what a fleet designed to yield does. A client configured with a node name breaks the
 first time citizenship works.
 
-So `fleet` starts a **tiny proxy on your own node, bound to loopback**, and points the client at
-that. The client's endpoint is then a constant:
+So `fleet` starts a **tiny proxy bound to loopback on whatever node you are on**, and points the
+client at that. The client's endpoint is then a constant:
 
 ```
 ANTHROPIC_BASE_URL=http://127.0.0.1:<port>      # never changes
@@ -426,10 +503,16 @@ hand:
   *busy*.
 - **One place to put the API key**, rather than in every client config on every node.
 
-**The one honest limit on waiting:** tier 2 takes 27 minutes to come back from cold. Blocking a
-client silently for 27 minutes is worse than saying so. The proxy waits up to a configured
-`max_wait_seconds` (default 120) and past that returns a message naming the wait and the reason,
-rather than hanging. Tier 1 restarts in minutes, so it almost never trips this.
+**The proxy is not a daemon** (§0.2). It runs in the foreground process group of the `fleet`
+command that started it and exits when that command does — plus a watchdog that exits if its parent
+is gone and nothing has connected for 60 seconds. It is a child of something you typed, not a
+background service, and it holds no Slurm resources.
+
+**The one honest limit on waiting:** the specialist takes 27 minutes to come back from cold.
+Blocking a client silently for 27 minutes is worse than saying so. The proxy waits up to a
+configured `max_wait_seconds` (default 120) and past that returns a message naming the wait and the
+reason, rather than hanging. The everyday helper restarts in minutes, so it almost never trips
+this.
 
 This is the `srun --overlap` relay idea from earlier revisions, reduced to something much simpler:
 tier 1 is reachable over the network, so the proxy is an ordinary HTTP forward and needs none of the
@@ -553,8 +636,25 @@ checked — not flipping the flag and hoping.
 
 A 2-CPU job on `c3_short` that derives everything from `squeue`, keeps no inventory state, submits
 its successor at birth with `--dependency=afterany:$SLURM_JOB_ID`, checks `${FLEET_STATE}/STOP`
-first, takes one action per 30 s cycle with the reason logged, and is backstopped by a daily
-systemd `--user` timer with `Persistent=true`. `fleet down` writes `STOP`, then cancels.
+first, and takes one action per 30 s cycle with the reason logged. `fleet down` writes `STOP`, then
+cancels.
+
+**No systemd timer.** An earlier revision had a daily `--user` timer as a backstop, to resurrect the
+chain if it ever died entirely. **Removed** under the constraint in §0.2: a systemd unit is not a
+Slurm job and `scancel` cannot touch it. The resurrection path is now simply *the next person who
+types `fleet`* — which is the only moment anybody cares that the fleet is down.
+
+**On `SIGTERM`, decide whether this was a handoff or a human.** Slurm sends `SIGTERM` both at
+walltime (via `--signal=B:TERM@120`) and on `scancel`. The supervisor tells them apart by looking at
+its own remaining walltime:
+
+- **near the end** → normal rollover. Drain, publish, exit 0, let the successor take over.
+- **not near the end** → somebody cancelled us. **Write `STOP` before exiting**, so the pending
+  successor starts, reads it, and turns around in two seconds.
+
+That is what makes `scancel -u $USER` a real kill switch rather than a way to trigger a restart.
+`scancel -9` and a node dying give no chance to write anything, and the successor will start; that is
+correct for node death, and `fleet down` covers the other case.
 
 Two tier-2 adjustments: **readiness is a generated token, not a listening socket** (27-minute load;
 a timeout written for ollama fires at 3 % — `DESIGN.md` §14.3 anticipated this), timeout 45 minutes.
@@ -578,7 +678,7 @@ costs the scheduler nothing.
 | 8b | **the standard helper on one card, under 6 concurrent users** | §4.2 — whether the floor alone is good enough, which is the question that decides everything |
 | 9 | Tier 1 under 6 simulated concurrent users | the number this whole project is for |
 | 12 | **the `eval/` suite, run by Claude** — plumbing, speed, capability on our own repos, and the pushback test | §11.3 — the only thing that turns judgement into numbers |
-| 10 | `c3` preemption: fill a node, submit a `c3_short` job, watch for state `S` | §14 — **touches a shared queue, confirm first** |
+| 10 | `c3` preemption: fill a node, submit a `c3_short` job, watch for state `S` | §0.3 decision 4 — **pre-authorised, §0.1** |
 | 11 | Chain: job A submits B with `afterany`; cancel A; confirm B runs | the restart mechanism |
 
 **Tests 4–9 are the campaign that decides whether this service is worth running.** Do them before
@@ -873,13 +973,15 @@ because ollama was already proven. Nothing in this design is.
 
 ## 13. Decisions that are yours
 
-1. **Does tier 1 bind the cluster network?** It must, to serve more than one node. That is an
-   explicit weakening of the loopback control (§6). Tier 3 stays socket-free regardless.
+1. ~~Does tier 1 bind the cluster network?~~ **Settled, §0.3: yes, with an API key.** The batch
+   tier stays socket-free.
 2. **How much of the pool may the fleet hold?** §4.4 proposes up to 3 `c3` nodes for interactive
    work, compute306 for tier 1, batch workers on whatever remains, and **never the last free GPU**.
    Batch workers are the greedy-looking part and the cheapest to give back — if the objection is
    optics rather than impact, cap them explicitly and say so in the README.
-3. **Which tier-1 model?** §4.2 makes this task one of P1 rather than a guess in a document.
+3. **Which exact checkpoints?** The *shape* is settled (§0.4: sparse MoE, ≤36 GB at int4, ≤10B
+   active, fewest active parameters that clears the quality bar). Picking the two actual
+   checkpoints is still task one of P1, and needs the roster that exists at build time.
 4. **Which client does `fleet` open?** Not *whether* to write an adapter — §6.1 settled that: the
    local proxy has to exist anyway, and translating between the OpenAI and Anthropic shapes inside
    it is nearly free. The open question is only which terminal client the lab standardises on.
