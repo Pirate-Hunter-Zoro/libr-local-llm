@@ -318,33 +318,36 @@ a spec'' is a demo, and we want to know that early.}
 
 \begin{center}
 \begin{tikzpicture}[font=\small, >={Stealth[length=2.5mm]},
-  st/.style={draw=black!45, fill=black!6, rounded corners, minimum width=2.9cm,
+  st/.style={draw=black!45, fill=black!6, rounded corners, minimum width=3.0cm,
              minimum height=1.5cm, align=center}]
-\node[st] (a) at (0,0)    {\textbf{1}\\log in to a\\lab computer};
-\node[st] (b) at (3.5,0)  {\textbf{2}\\open VSCode,\\like always};
-\node[st] (c) at (7.0,0)  {\textbf{3}\\type your\\question};
-\node[st, draw=green!45!black, fill=green!14] (d) at (10.5,0) {\textbf{4}\\read the\\answer};
-\draw[->, thick] (a) -- (b); \draw[->, thick] (b) -- (c); \draw[->, thick] (c) -- (d);
+\node[st] (a) at (0,0)   {\textbf{1}\\log in to a\\lab computer};
+\node[st] (b) at (3.8,0) {\textbf{2}\\type one word:\\\texttt{\textbf{fleet}}};
+\node[st, draw=green!45!black, fill=green!14] (c) at (7.6,0) {\textbf{3}\\start asking\\questions};
+\draw[->, thick] (a) -- (b); \draw[->, thick] (b) -- (c);
 \end{tikzpicture}
 \end{center}
 
-\vspace{0.8em}
-\keybox{\textbf{That is the whole thing.} The same terminal window you already use. The same way of
-asking. You would not be able to tell from the screen that the answer came from down the hall
-instead of from California.}
+\vspace{0.5em}
+\keybox{\textbf{That is the whole interface.} One word. No settings, no flags, no remembering which
+helper to ask for. It starts anything that is not already running, waits for it, picks up your last
+conversation in that folder, and opens.}
 
-\vspace{0.8em}
+\vspace{0.7em}
 \begin{center}
 \small
 \begin{tabular}{@{}ll@{}}
 \toprule
-\texttt{fleet code} & start working. Talks to the everyday helper \\
-\texttt{fleet ask "\ldots"} & send one hard question to the specialist and wait \\
-\texttt{fleet status} & is it running? is anyone queued? \\
-\texttt{fleet down} & stop everything \\
+\texttt{fleet} & \textbf{everything.} This is the one you type \\
+\texttt{fleet status} & is it running? is anyone waiting? \\
+\texttt{fleet down} & switch it off now, rather than letting it idle off \\
 \bottomrule
 \end{tabular}
 \end{center}
+
+\vspace{0.5em}
+{\small \textbf{You never ask for the specialist by name either.} When a question is hard, the
+everyday helper goes and consults it, says so, and comes back with the answer --- the same way you
+would ask a colleague to check something with an expert.}
 
 \end{frame}
 
@@ -385,33 +388,33 @@ number you are using, you do not get two conversations --- you get one, tangled 
 %----------------------------------------------------------
 \begin{frame}{Being a good neighbour}
 
-These are shared computers. Other people in the lab are running their own work on them, and our
-assistant would be sitting on a fair chunk of them all day.
-
-\vspace{0.6em}
-\begin{center}
-\begin{tikzpicture}[font=\small, >={Stealth[length=2.5mm]},
-  st/.style={draw=black!45, fill=black!6, rounded corners, minimum width=2.5cm,
-             minimum height=1.5cm, align=center},
-  hot/.style={draw=orange!70!black, thick, fill=orange!15, rounded corners,
-              minimum width=2.5cm, minimum height=1.5cm, align=center}]
-\node[st]  (a) at (0,0)    {\textbf{1}\\a colleague's\\job is stuck};
-\node[hot] (b) at (3.2,0)  {\textbf{2}\\finish the\\answer in progress};
-\node[hot] (c) at (6.4,0)  {\textbf{3}\\hand the\\computer back};
-\node[st]  (d) at (9.6,0)  {\textbf{4}\\wait --- do not\\grab it again};
-\node[st]  (e) at (12.8,0) {\textbf{5}\\restart once\\they are running};
-\draw[->, thick] (a)--(b); \draw[->, thick] (b)--(c); \draw[->, thick] (c)--(d); \draw[->, thick] (d)--(e);
-\end{tikzpicture}
-\end{center}
-
-\vspace{0.5em}
-\keybox{\small \textbf{Step 4 is the one that matters.} Without it the system hands a computer back, notices
-a second later that it is short of computers, and grabs the same one straight back --- beating the
-very colleague it was trying to help. It would look rude while running code written to be polite.}
+{\small These are shared computers, and our assistant would sit on a fair chunk of them all day.
+\textbf{Every part of sharing them politely is automatic.} You do nothing.}
 
 \vspace{0.4em}
-{\small It switches itself off when nobody has used it for a few hours, and back on when someone
-does. It restarts itself if it crashes. Nobody babysits it.}
+\vspace{0.5em}
+\keybox{\small \textbf{The subtle one is ``waits''.} Without it the system hands a computer back,
+notices a second later that it is short of computers, and grabs the same one straight back ---
+beating the very colleague it was trying to help. It would look rude while running code written to
+be polite.}
+
+\vspace{0.4em}
+\begin{center}
+\scriptsize
+\begin{tabular}{@{}ll@{}}
+\toprule
+notices a colleague is stuck & \textbf{automatic} \\
+\textbf{finishes the answer you are waiting on first} & \textbf{automatic} --- it never cuts you off mid-sentence \\
+hands the computer back, waits, takes it again later & \textbf{automatic} \\
+switches off when unused, back on when needed & \textbf{automatic} \\
+restarts itself after a crash & \textbf{automatic} \\
+reconnects you when it moves to a different computer & \textbf{automatic} \\
+holds your question while it is starting up & \textbf{automatic} --- you see ``starting'', not an error \\
+\midrule
+\textbf{switch it off right now} & \textbf{the only button you ever press} \\
+\bottomrule
+\end{tabular}
+\end{center}
 
 \end{frame}
 

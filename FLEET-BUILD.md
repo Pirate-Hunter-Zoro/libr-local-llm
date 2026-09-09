@@ -264,28 +264,74 @@ four GPUs on one node, for far more risk. Revisit if the four-GPU measurement di
 
 ---
 
-## 6. The front door
+## 6. The front door: one word, and it stays connected
 
-colibrì serves the **Anthropic Messages API at `/v1/messages`** alongside OpenAI
-`/v1/chat/completions`, with GLM-5.2 supporting tools in both shapes. **Claude Code points at it
-with three environment variables** — `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` —
-no shim. vLLM serves OpenAI-compatible HTTP, which Claude Code does not speak natively, so tier 1
-needs either opencode or a thin Anthropic-shaped adapter in front of vLLM. **Deciding that is §11
-decision 4** and it materially affects the daily experience.
+**The command is `fleet`.** No subcommand, no arguments, no flags to remember. Typing it opens a
+working assistant. Everything else is administrative and optional.
 
-**Multi-user changes the network question.** A loopback bind means one user per node, which defeats
-the point. Tier 1 must be reachable from other nodes, so it binds the cluster interface **with an
-API key**, and that is a deliberate, recorded weakening of the current control — `DESIGN.md` §5.4
-option C, which it says needs an explicit decision rather than a config edit.
+```
+fleet          # open the assistant. That is the whole interface.
+```
 
-The mitigation is the two-plane split `DESIGN.md` §5.4 recommends and it should be built in from the
-start: **tier 3 (PHI corpus work) stays on the filesystem queue with no socket at all**, and tier 1
-is the conversational plane. One router serving both is how they get confused.
+What `fleet` does, in order, printing what it is waiting on at every step:
 
-`KVSAVE=0` is mandatory on tier 2: colibrì persists conversation KV to a dot-file **inside the
-model directory** by default — roughly 182 KB per token of PHI-derived state on a shared filesystem.
+1. **Is a client-side proxy running on this node?** If not, start it (§6.1).
+2. **Is tier 1 serving?** If yes, attach and open the client. Done, in about a second.
+3. **If not**, start the supervisor if it is absent, ask it for tier 1, and **wait** — showing the
+   pending reason and an estimate, never a bare error. Then attach.
+4. **Resume the last session** in this directory if there is one, the way `ollama-code -c` already
+   does. opencode and Claude Code both scope sessions per project directory and both keep them on
+   NFS home, so this works from whichever node you land on.
 
-### 6.1 The two "API keys", only one of which is real
+Administrative commands, which a normal day never needs: `fleet status` (what is up, what is warm,
+who is queued), `fleet down` (stop everything and stay stopped), `fleet ask "…"` (one-shot from a
+script). **`fleet up` does not exist** — `fleet` brings up whatever it needs.
+
+**Escalation is not a command either.** Reaching the 744B model is a *tool the assistant has*, used
+inside the conversation, not something you type at a shell. You ask a hard question; it decides to
+consult, tells you it is doing so, and comes back. §11.2 covers when that fires.
+
+### 6.1 The local proxy — why `fleet` needs one, and what it buys
+
+Tier 1 binds the cluster network (it must, to serve more than one node), so its address is
+`<whatever node it is on>:8000`. **That address changes whenever the fleet moves the backend**, which
+is precisely what a fleet designed to yield does. A client configured with a node name breaks the
+first time citizenship works.
+
+So `fleet` starts a **tiny proxy on your own node, bound to loopback**, and points the client at
+that. The client's endpoint is then a constant:
+
+```
+ANTHROPIC_BASE_URL=http://127.0.0.1:<port>      # never changes
+ANTHROPIC_API_KEY=local                          # a dummy word; see §6.2
+```
+
+The proxy re-reads the published inventory each cycle and forwards to wherever tier 1 currently is.
+Three properties fall out of it, and all three are things the user would otherwise have to do by
+hand:
+
+- **A backend that moves is invisible.** The session survives the fleet yielding a node and
+  regrowing on another.
+- **A request that arrives while the fleet is down waits instead of failing.** This is the rule that
+  makes "it just works" true: the proxy holds the request, prints what it is waiting for, and
+  forwards it when the backend answers. An error message reads as *broken*; a progress line reads as
+  *busy*.
+- **One place to put the API key**, rather than in every client config on every node.
+
+**The one honest limit on waiting:** tier 2 takes 27 minutes to come back from cold. Blocking a
+client silently for 27 minutes is worse than saying so. The proxy waits up to a configured
+`max_wait_seconds` (default 120) and past that returns a message naming the wait and the reason,
+rather than hanging. Tier 1 restarts in minutes, so it almost never trips this.
+
+This is the `srun --overlap` relay idea from earlier revisions, reduced to something much simpler:
+tier 1 is reachable over the network, so the proxy is an ordinary HTTP forward and needs none of the
+stdio machinery. **Keep the relay design filed** for the case where a plane must stay loopback-only.
+
+vLLM serves OpenAI-shaped HTTP and Claude Code speaks Anthropic-shaped HTTP. The proxy is the
+natural place to translate between them, which removes §12 decision 4's awkward "two clients"
+option — **the adapter and the proxy are the same small program.**
+
+### 6.2 The two "API keys", only one of which is real
 
 These get confused, and the confusing one has Anthropic's name on it.
 
@@ -317,7 +363,7 @@ eventually go looking for one.
 because ollama has none. colibrì having one **closes** a recorded gap rather than opening a new
 requirement.
 
-### 6.2 The key does not make the client local
+### 6.3 The key does not make the client local
 
 Pointing `ANTHROPIC_BASE_URL` at our server routes **model calls** locally. It does not make the
 client itself offline. `DESIGN.md` §9 states the rule and it survives this revision unchanged: the
@@ -346,6 +392,46 @@ either previous revision and it has to be argued rather than assumed.
 - **Fair-share.** Tier 1 bills ~92 CPUs and 4 GPUs; tier 2 bills ~92 CPUs and 1 GPU. This is no
   longer a rounding error against our own pipeline jobs and must be measured before and during
   (`DESIGN.md` §13).
+
+---
+
+### 7.1 What is automatic, and the one thing that is not
+
+The user does nothing to be a good neighbour. Every line below is the supervisor's job, on a 30-second
+cycle, with the reason logged.
+
+| | automatic? | what actually happens |
+|---|---|---|
+| noticing a colleague is blocked | **yes** | the yield predicate, every cycle |
+| finishing the answer already in flight | **yes** | drain first, cancel second — never the other way |
+| handing the node back | **yes** | |
+| not immediately re-taking it | **yes** | the hold-off, §7 |
+| coming back when the cluster frees up | **yes** | the convergence loop regrows toward target |
+| releasing when nobody has used it | **yes** | idle timeout: tier 1 minutes, tier 2 three hours |
+| restarting after a crash or walltime | **yes** | the successor chain, §8 |
+| reconnecting your session to the new backend | **yes** | the local proxy, §6.1 |
+| holding your request while it regrows | **yes**, up to `max_wait_seconds` | §6.1 |
+| **stopping it altogether** | **no — `fleet down`** | the only manual action, and only if you want it off *now* rather than in a few hours |
+
+**"It completes what it started" — precisely how true that is.** Three cases, and they differ:
+
+- **A yield while you are waiting on an answer: yes, genuinely.** Draining means the in-flight
+  generation finishes before the job is cancelled. A yield that kills a generation mid-stream is a
+  bug, and it will be reported as "the local model is unreliable" — correctly.
+- **Walltime or a crash mid-answer: the conversation survives, the sentence does not.** The client
+  keeps the partial text, the session store is on NFS home and readable from every node, and the
+  prompt re-prefills cheaply against the cached prefix. So it resumes — by re-asking, not by
+  continuing mid-token. `--signal=B:TERM@120` gives a two-minute drain window before walltime, which
+  covers a 500-token answer at tier-2 speed and does **not** cover a 3,000-token reasoning answer.
+- **A node failure: the session survives, the answer is lost.** Nothing in user space prevents that.
+
+**One tension to decide rather than inherit.** colibrì can persist conversation state across engine
+restarts, which is exactly what makes a resumed conversation warm instead of re-prefilled. But it
+writes that state into the model directory on shared storage — 182 KB per token of PHI-derived
+material. §10 sets `KVSAVE=0` for that reason, and the cost is that a restart re-prefills. **Warm
+resume and the PHI boundary are in direct conflict here**, the boundary wins by default, and if the
+re-prefill turns out to hurt, the fix is a model directory whose permissions have actually been
+checked — not flipping the flag and hoping.
 
 ---
 
@@ -407,7 +493,7 @@ as current state. Never sample during a cold start.
 Starting configuration, to be replaced by `coli tune`: `CUDA_DENSE=1`, `RAM_GB≈450`, `PIN=stats`
 with a large `PIN_GB`, `XEXP=1` (measure), `DIRECT=1 PIPE=1`, **`URING` and `PILOT*` off** (+26 %
 once resident — they only burn the scarce CPU), `CTX=131072`, `COLI_PREFILL_CHUNK=2048`,
-`KVSAVE=0`, `COLI_API_KEY` set (§6.1), `COLI_USAGE_DECAY` on, `KV_SLOTS=1` with `DRAFT` measured.
+`KVSAVE=0`, `COLI_API_KEY` set (§6.2), `COLI_USAGE_DECAY` on, `KV_SLOTS=1` with `DRAFT` measured.
 
 ---
 
@@ -464,7 +550,7 @@ Four mechanisms that do work, in order of reliability:
 
 | mechanism | trigger | cost |
 |---|---|---|
-| **the human escalates** | you type `fleet ask` | you must know you are stuck; usually you do |
+| **the human escalates** | you say so in the conversation — "go ask the big model" | you must know you are stuck; usually you do |
 | **observable loop signals** | tool calls past N, same file edited 3+ times, a test failing twice, self-contradiction across turns | crude, but the harness can see these **without asking the model** |
 | **task-shape declaration** | "design", "decide between", "why is this slow", "review this before it lands" — categories named up front | needs discipline, not intelligence |
 | **second opinion on write** | any artifact that outlives the session — a design doc, a schema, a migration — gets one tier-2 pass before it lands | a minute per document; cheap |
@@ -585,8 +671,9 @@ otherwise be iterating.
 2. **Is compute306 entire, plus one c3 node, an acceptable standing claim?** That is the real
    footprint. If not, tier 1 shrinks to a single-GPU model and the quality target moves with it.
 3. **Which tier-1 model?** §4.2 makes this task one of P1 rather than a guess in a document.
-4. **Claude Code everywhere, or opencode for tier 1?** colibrì speaks Anthropic natively; vLLM does
-   not. Either write a thin adapter or accept two clients.
+4. **Which client does `fleet` open?** Not *whether* to write an adapter — §6.1 settled that: the
+   local proxy has to exist anyway, and translating between the OpenAI and Anthropic shapes inside
+   it is nearly free. The open question is only which terminal client the lab standardises on.
 5. **If tier 1 measures well, is tier 2 still worth 372 GB and a node?** Ask it again after test 9.
    A good 235B at int4 may make the 744B a luxury. **A blind side-by-side on real tasks from our own
    repos is owed** before tier 2 is built — see §11.1 for what the quality evidence actually says, and
