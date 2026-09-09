@@ -289,36 +289,62 @@ variable is not --- which is exactly why helper 1 exists.}
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{How good is the specialist, really?}
-
-The honest answer depends entirely on \emph{what kind} of question you ask.
+\begin{frame}{How good are they, really --- next to Claude}
 
 \begin{center}
 \scriptsize
-\renewcommand{\arraystretch}{1.3}
-\begin{tabular}{@{}p{0.42\textwidth}p{0.26\textwidth}p{0.24\textwidth}@{}}
+\renewcommand{\arraystretch}{1.12}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}p{0.33\textwidth}cccc@{}}
 \toprule
-\textbf{What you ask} & \textbf{Versus Claude} & \textbf{How long} \\
+\textbf{What you are asking for}
+ & \textbf{\begin{tabular}{@{}c@{}}standard\\helper\end{tabular}}
+ & \textbf{\begin{tabular}{@{}c@{}}bigger\\helper\end{tabular}}
+ & \textbf{\begin{tabular}{@{}c@{}}the\\specialist\end{tabular}}
+ & \textbf{Claude} \\
 \midrule
-``Here is a function and a bug report --- what is wrong?'' & \textbf{genuinely close} &
-1--4 minutes \\
-``Which of these two designs is better, and why?'' & \textbf{genuinely close} & 1--4 minutes \\
-``Read these eight files and find the inconsistency'' & \textbf{not close} & several minutes
-before it even starts \\
-``Keep working on this with me for an hour'' & \textbf{don't} & see the next slide \\
+Explain what this code does
+ & \textcolor{green!40!black}{\textbf{close}} & \textcolor{green!40!black}{\textbf{close}}
+ & \textcolor{green!40!black}{\textbf{close}} & yardstick \\
+Write a small function to a spec
+ & \textcolor{green!40!black}{\textbf{close}} & \textcolor{green!40!black}{\textbf{close}}
+ & \textcolor{green!40!black}{\textbf{close}} & yardstick \\
+Find a bug you can point at
+ & \textcolor{orange!70!black}{worse} & \textcolor{green!40!black}{\textbf{close}}
+ & \textcolor{green!40!black}{\textbf{close}} & yardstick \\
+Weigh two designs against each other
+ & \textcolor{orange!70!black}{worse} & \textcolor{orange!70!black}{worse}
+ & \textcolor{green!40!black}{\textbf{close}} & yardstick \\
+Work through a written spec, many files
+ & \textcolor{orange!70!black}{worse} & \textcolor{orange!70!black}{worse}
+ & \textcolor{red!65!black}{\textbf{no}} \tiny{too slow} & yardstick \\
+Stay on track over a long session
+ & \textcolor{orange!70!black}{worse} & \textcolor{orange!70!black}{worse}
+ & \textcolor{red!65!black}{\textbf{no}} & yardstick \\
+Spot something subtle nobody flagged
+ & \textcolor{red!65!black}{\textbf{no}} & \textcolor{orange!70!black}{worse}
+ & \textcolor{orange!70!black}{worse} & yardstick \\
+\textbf{Know when it is wrong}
+ & \textcolor{red!65!black}{\textbf{no}} & \textcolor{red!65!black}{\textbf{no}}
+ & \textcolor{red!65!black}{\textbf{no}} & \textbf{imperfect too} \\
+\midrule
+\emph{a page of text takes} & \emph{20--30 s} & \emph{20--30 s} & \emph{about a minute} & \emph{about 9 s} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\vspace{0.4em}
-\keybox{\small \textbf{One hard question, with everything it needs already in front of it.} That is
-what the specialist is for, and there it is worth the wait. When the job becomes ``hold a lot in
-your head and notice something subtle'', the gap opens wide.}
+\vspace{0.1em}
+\begin{center}{\scriptsize \textcolor{green!40!black}{\textbf{close}} = you would rarely notice
+\quad \textcolor{orange!70!black}{worse} = noticeably, but usable \quad
+\textcolor{red!65!black}{\textbf{no}} = use a different one}\end{center}
 
-\vspace{0.3em}
-{\small \textbf{An awkward twist:} the harder the question, the more it thinks before answering ---
-and thinking is what it is slow at. The questions most worth asking are the ones you wait longest
-for.}
+\vspace{0.4em}
+\keybox{\scriptsize \textbf{Read the shape, not the cells.} The specialist is the \emph{best} of
+ours at one hard question and the \emph{worst} at a long piece of work --- long work means many
+turns, and it is slow. \textbf{The fast helpers beat it on anything that needs iterating}, which is
+why it is consulted rather than talked to. And the last row is the honest one: \textbf{none of them
+reliably knows when it is wrong}, ours least of all. \textbf{This table is judgement, not
+measurement} --- slide 16 is the test that replaces it.}
 
 \end{frame}
 
