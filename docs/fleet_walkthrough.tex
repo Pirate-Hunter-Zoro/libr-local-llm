@@ -144,7 +144,7 @@ should be talking to. \textbf{The next slide is why a smaller model escapes this
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{Why a smaller model escapes it --- so: three helpers}
+\begin{frame}{Why a smaller model escapes it --- so: more than one helper}
 
 \begin{center}
 \scriptsize
@@ -180,6 +180,48 @@ suddenly costs almost nothing.}
 \draw[->, very thick, green!45!black] (a) -- node[font=\scriptsize, above] {it consults} (b);
 \end{tikzpicture}}
 \end{center}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{What we actually have to work with}
+
+\begin{center}
+\resizebox{0.98\textwidth}{!}{%
+\begin{tikzpicture}[font=\small,
+  nd/.style={draw=black!45, rounded corners=3pt, fill=black!4, minimum width=2.4cm,
+             minimum height=2.5cm, align=center},
+  g/.style={draw=black!55, fill=white, rounded corners=1.5pt, minimum width=0.55cm,
+            minimum height=0.55cm, inner sep=0pt, font=\tiny},
+  lbl/.style={font=\tiny, inner sep=1pt}
+]
+\foreach \i/\x in {0/0, 1/2.7, 2/5.4, 3/8.1, 4/10.8, 5/13.5} {
+  \node[nd] (n\i) at (\x,0) {};
+  \node[lbl, text=black!70] at (\x,1.0) {\textbf{compute30\i}};
+  \node[g, fill=green!25] at (\x,0.15) {};
+  \node[lbl, text=black!55] at (\x,-0.5) {1 graphics card};
+  \node[lbl, text=black!55] at (\x,-0.85) {1 TB memory};
+}
+\node[nd, minimum width=4.0cm, draw=blue!55!black, very thick, fill=blue!8] (n6) at (17.0,0) {};
+\node[lbl, text=blue!45!black] at (17.0,1.0) {\textbf{compute306}};
+\foreach \k/\dx in {0/-0.95, 1/-0.32, 2/0.32, 3/0.95} { \node[g, fill=blue!30] at (17.0+\dx,0.15) {}; }
+\node[lbl, text=black!55] at (17.0,-0.5) {\textbf{4 graphics cards}};
+\node[lbl, text=black!55] at (17.0,-0.85) {1 TB memory};
+\end{tikzpicture}}
+\end{center}
+
+\vspace{0.5em}
+\keybox{\Large \textbf{7 computers. 10 graphics cards. 7 terabytes of memory.}}
+
+\vspace{0.8em}
+{\small \textbf{Only compute306 can hold the good everyday model} --- it needs four cards' worth of
+space, and nothing else has four. The other six computers hold one card each, which is enough for
+the specialist, or for a smaller helper, or for overnight paperwork.}
+
+\vspace{0.4em}
+{\small \textbf{And a warning about what more cards buy you.} More cards means \emph{more people
+served at once}. It does \textbf{not} make your own answer come back faster. Ten cards and one
+person is exactly as fast as one card and one person.}
 
 \end{frame}
 
@@ -384,10 +426,65 @@ number you are using, you do not get two conversations --- you get one, tangled 
 \end{frame}
 
 %----------------------------------------------------------
+\begin{frame}{How the machines get shared --- and why nobody gets blocked}
+
+\begin{center}
+\resizebox{0.98\textwidth}{!}{%
+\begin{tikzpicture}[font=\small,
+  nd/.style={rounded corners=3pt, minimum width=2.5cm, minimum height=1.9cm, align=center,
+             draw=black!45},
+  lbl/.style={font=\tiny, inner sep=1pt},
+  tag/.style={font=\scriptsize, align=center}
+]
+% six single-card nodes
+\node[nd, fill=green!16, draw=green!45!black] (n0) at (0,0)    {};
+\node[nd, fill=green!16, draw=green!45!black] (n1) at (2.8,0)  {};
+\node[nd, fill=green!16, draw=green!45!black] (n2) at (5.6,0)  {};
+\node[nd, fill=orange!18, draw=orange!70!black, thick] (n3) at (8.4,0) {};
+\node[nd, fill=black!3,  draw=black!35, dashed] (n4) at (11.2,0) {};
+\node[nd, fill=green!16, draw=green!45!black] (n5) at (14.0,0) {};
+\node[nd, fill=red!12, draw=red!65!black, very thick, minimum width=3.6cm] (n6) at (17.6,0) {};
+
+\foreach \i/\x in {0/0, 1/2.8, 2/5.6, 3/8.4, 4/11.2, 5/14.0} {
+  \node[lbl, text=black!70] at (\x,1.2) {\textbf{compute30\i}};}
+\node[lbl, text=black!70] at (17.6,1.2) {\textbf{compute306} (4 cards)};
+
+\node[tag] at (0,0.15)    {overnight\\paperwork};
+\node[tag] at (2.8,0.15)  {overnight\\paperwork};
+\node[tag] at (5.6,0.15)  {spare\\capacity};
+\node[tag] at (8.4,0.15)  {\textbf{the}\\\textbf{specialist}};
+\node[tag] at (11.2,0.15) {\textbf{ALWAYS}\\\textbf{LEFT FREE}};
+\node[tag] at (14.0,0.15) {overnight\\paperwork};
+\node[tag] at (17.6,0.15) {\textbf{the everyday helper}\\\emph{everyone talks to this}};
+
+\node[lbl, text=green!30!black] at (0,-1.25)    {back in seconds};
+\node[lbl, text=green!30!black] at (2.8,-1.25)  {back in seconds};
+\node[lbl, text=green!30!black] at (5.6,-1.25)  {back in seconds};
+\node[lbl, text=orange!60!black] at (8.4,-1.25) {back in 27 minutes};
+\node[lbl, text=black!50] at (11.2,-1.25)       {never taken};
+\node[lbl, text=green!30!black] at (14.0,-1.25) {back in seconds};
+\node[lbl, text=red!60!black] at (17.6,-1.25)   {back in minutes};
+\end{tikzpicture}}
+\end{center}
+
+\vspace{0.4em}
+\keybox{\textbf{Of ten graphics cards, eight can be handed back within seconds}, because what is
+running on them is paperwork that can be stopped mid-page and picked up later. \textbf{One is never
+taken at all.}}
+
+\vspace{0.5em}
+{\small \textbf{So how does a colleague get a machine?} Two ways, and neither needs them to ask us.
+\textbf{One is already free} --- we always leave one. And if they need more than that, the system
+sees their job waiting, finishes whatever answer is in progress, and hands a machine back on its
+own. Usually within a minute.}
+
+\end{frame}
+
+%----------------------------------------------------------
 \begin{frame}{Being a good neighbour}
 
-{\small These are shared computers, and our assistant would sit on a fair chunk of them all day.
-\textbf{Every part of sharing them politely is automatic.} You do nothing.}
+{\small Everything on the previous slide happens \textbf{by itself}. Nobody negotiates, nobody
+emails, nobody has to remember to switch anything off. \textbf{You do nothing.}}
 
 \vspace{0.4em}
 \vspace{0.5em}

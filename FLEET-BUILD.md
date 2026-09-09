@@ -25,6 +25,11 @@ model at **20–40 tok/s**, with a **744B model reachable as an escalation** whe
 it. That is close enough to the hosted experience that the difference is noticeable but not
 disabling.
 
+**On what hardware:** an elastic pool over **7 nodes and 10 A40s** (§4), filled in priority order as
+GPUs come free and emptied in reverse as others need them. Six people do not need ten GPUs — one
+tier-1 instance absorbs them — so the rest go to the specialist and to batch corpus work, and eight
+of the ten release within seconds.
+
 **What you cannot have:** the 744B model itself at conversational speed for everyone. §3.3 is the
 arithmetic and it is not a tuning problem — it is a property of top-8-of-256 expert routing.
 
@@ -178,62 +183,112 @@ is a modelled multiplier and the campaign in §9 replaces them.
 
 ---
 
-## 4. The architecture: three tiers on different hardware
+## 4. The architecture: an elastic pool over 10 GPUs
 
-```
-                    ssh + VSCode terminal, any node
-                                  |
-                        Claude Code / opencode
-                                  |
-        +-------------------------+--------------------------+
-        |                                                    |
-   TIER 1  the daily driver                          TIER 2  the consultant
-   vLLM, compute306, 4x A40 TP=4                     colibri, one c3 node
-   ~200-250B MoE at int4 (~120 GB)                   GLM-5.2 744B int4, 372 GB
-   continuous batching, MANY USERS                   KV_SLOTS=1 + MTP speculation
-   20-40 tok/s each          (projected)             8-12 tok/s, ONE at a time
-        |                                                    ^
-        |  the agent loop runs here                          |
-        +------------- "ask the big model" tool -------------+
+### 4.0 What we actually have
 
-   TIER 3  batch corpus work -- vLLM replicas on the remaining c3 nodes,
-           filesystem work queue, no socket at all.  PSYCH-ASR Stage 3c.
-```
+| | nodes | GPUs | VRAM | RAM |
+|---|---|---|---|---|
+| `c3` / `c3_short` | compute300–305 | **1× A40 each** | 46 GB each | 1 TB each |
+| `c3_accel` | compute306 | **4× A40** | 184 GB | 1 TB |
+| **total** | **7 nodes** | **10 A40s** | **460 GB** | **7 TB** |
 
-### 4.1 Why this is the right shape
+Earlier revisions of this file talked as though the service were one or two fixed boxes. It is not.
+**It is a pool of ten independently allocatable GPUs, and the right design fills them when they are
+free and empties them when they are not.**
 
-- **Tier 1 does what colibrì structurally cannot: serve many people fast.** A ~20B-active MoE has a
-  far smaller expert union per token and vLLM's continuous batching is built for exactly this. It
-  is also a *much* better model than the `qwen3-coder:30b` q4 GGUF that was judged inadequate —
-  roughly eight times the parameters, at int4 rather than q4, with vLLM's full-context sampling
-  rather than ollama's defaults. Judge the tier, not the memory of the old one.
-- **Tier 2 is reached the way a person reaches an expert: deliberately, for one hard question.** An
-  agent loop makes dozens of cheap calls and a few expensive ones. Routing every call to a 10 tok/s
-  model wastes the model and the person.
-- **compute306 finally has a defensible use.** 184 GB of VRAM is the only place on this cluster a
-  ~120 GB model fits, and a multi-user service is worth the cluster's only four-GPU node in a way a
-  single-user one never was. This **reverses** pass two's recommendation, and the reason is that the
-  node is now serving everybody.
-- **No router between tier 1 and tier 3.** They share no caller. Tier 2 is reached by an explicit
-  tool call, not by a quality heuristic — automatic cascade is research-grade and unreliable
-  (`DESIGN.md` §5.5).
+### 4.1 What fits on one GPU, and what does not
 
-### 4.2 Tier 1 model selection — a real task, not a footnote
+This is the constraint that shapes everything below.
 
-Requirement: fits in **184 GB minus KV cache**, so a ~110–130 GB checkpoint; MoE with ≲30B active
-for speed; **tool calling**; strong at code and reasoning. That points at a 200–250B-parameter MoE
-quantized to int4 (AWQ or GPTQ/Marlin — **no FP8, Ampere has no FP8 tensor cores**).
+| | usable for weights | what that holds |
+|---|---|---|
+| **1× A40** (46 GB) | ~36 GB after KV cache | a ~70B model at int4, or ~30B at 8-bit |
+| **4× A40** (184 GB) | ~150 GB after KV cache | a **~250–300B MoE at int4** — the quality tier |
 
-Do not take a model name from this document. **Selecting it is task one of P1**: enumerate what is
-actually available at that size with a working AWQ/GPTQ int4 checkpoint and tool-calling support,
-then measure two candidates on real tasks from our own repos before committing 120 GB of download.
+**No model spans nodes.** NVLink is inactive *within* compute306, and between nodes there is only
+40 Gb/s Ethernet — tensor parallelism over that is not a serious proposal. So compute306 is the only
+place the good model fits, and it fits exactly once.
 
-**Tensor parallelism across four cards has a cost here**: NVLink reports all links inactive, so
-TP=4 pays an all-reduce over PCIe on every layer. For a 20B-active MoE that all-reduce is on hidden
-states and is small, but it is measured, not assumed (§9 test 8). The alternative — two TP=2
-replicas — is worth the A/B.
+### 4.2 Replication scales users, and does not scale speed
 
----
+The distinction matters and it is easy to lose:
+
+- **Batching** (several people through one model) failed on the giant model, for the union reason in
+  §3.3.
+- **Replication** (several independent copies) has no union problem at all. Two replicas serve two
+  crowds at full speed each. It scales **linearly**, which batching never did.
+- **But a single user gets nothing from a second replica.** Ten GPUs do not make one answer faster.
+  They make more answers possible at once.
+
+**And for six people you do not need ten endpoints.** One vLLM instance with continuous batching on
+a VRAM-resident model serves tens of concurrent requests before per-user throughput degrades
+meaningfully — that is what the software is built for, and it is why tier 1 does not inherit the
+giant model's crowd problem. Replicas are the answer to *outgrowing* that, not to reaching it.
+
+So the other nine GPUs are not spare tier-1 capacity waiting to be switched on. They have better
+jobs, and the fleet should be taking them **when they are free** rather than leaving them idle.
+
+### 4.3 The pool, in priority order
+
+The supervisor does not maintain a fixed set of services. It fills free GPUs in this order and
+empties them in exactly the reverse:
+
+| rank | what goes on the next free GPU | where | cost to start | cost to lose |
+|---|---|---|---|---|
+| **1** | **tier-1 primary** — the quality endpoint everyone talks to | compute306, TP=4 | minutes | the service |
+| **2** | **the specialist** — colibrì, GLM-5.2 744B | one `c3` node, +~500 GB RAM, ~92 CPUs | **27 min** | escalation only |
+| **3** | **tier-1 overflow replicas** — only when measured concurrency exceeds what the primary absorbs | `c3` nodes, 1 GPU each | minutes | a little capacity |
+| **4** | **batch workers** — corpus work off the filesystem queue | every remaining `c3` node | seconds | one work item |
+
+**Yield order is the reverse: 4, then 3, then 2, then 1.** That is the ladder `DESIGN.md` §6.2 asked
+for, and it finally has more than one rung.
+
+Three properties fall out, and they are the whole answer to "is it OK to take everything?":
+
+- **Batch workers are free to surrender.** They claim one item at a time by atomic rename; killing
+  one mid-item costs that item, not the pass. So the fleet can hold six GPUs and hand any of them
+  back within seconds, having lost seconds of work.
+- **Overflow replicas are nearly free to surrender.** No session lives on a specific replica — the
+  local proxy (§6.1) moves callers to whichever replica is up.
+- **Only ranks 1 and 2 are expensive**, and they are one node each.
+
+> **So yes: take the whole cluster when it is idle.** The defensible version of that is not "hold
+> ten GPUs and be sorry"; it is **"hold ten GPUs of which eight can be released in seconds."**
+> Granularity is what makes greed acceptable, and `DESIGN.md` §6.3 said so before any of this was
+> designed.
+
+### 4.4 Standing caps, which still bind
+
+Elastic does not mean unlimited. The supervisor enforces, every cycle:
+
+| knob | default | why |
+|---|---|---|
+| `max_c3_nodes_interactive` | **3** | ranks 1–3. Batch workers are counted separately because they yield in seconds |
+| `max_c3_nodes_batch` | **all remaining** | they are the polite tenant; let them soak up idle capacity |
+| `reserve_free_nodes` | **1** | never take the last free GPU in the partition, even if nothing is pending. Somebody about to submit should not find the cluster empty because of us |
+| `accel_bookings` | 1 | there is only one four-GPU node |
+
+`reserve_free_nodes` is new in this revision and it is the cheapest goodwill available: it costs one
+GPU of ten and it means a colleague's interactive job never waits on us at all.
+
+### 4.5 Tier-1 model selection — now a two-sided decision
+
+Requirement: fits 184 GB minus KV, MoE with ≲30B active, **tool calling**, strong at code, and int4
+(AWQ or GPTQ/Marlin — **Ampere has no FP8**). Selecting it is task one of P1.
+
+The pool adds a second question that did not exist when tier 1 was one fixed box: **compute306 can
+be one big endpoint or four small ones.**
+
+| | one ~250B model, TP=4 | four ~36 GB replicas |
+|---|---|---|
+| quality per answer | **higher** | lower |
+| endpoints | 1 (batching serves many) | 4 |
+| interconnect tax | an all-reduce every layer over PCIe | **none** |
+
+For six users, quality wins and TP=4 is right. Past roughly twenty, capacity wins. **Do not build
+the switch yet** — measure both (§9 test 8) and pick one; a supervisor that reshapes compute306 on
+demand is the clever version, and the clever version is not v1.
 
 ## 5. Cluster mode: real, and not yet ready
 
@@ -377,22 +432,28 @@ got, and that audit is part of adopting it, not a follow-up.**
 
 ## 7. Citizenship, revised for a service that is now genuinely large
 
-The standing claim is now **compute306 entire, plus one c3 node**. That is a much bigger ask than
-either previous revision and it has to be argued rather than assumed.
+**The fleet may hold most of the pool, and that is defensible for one reason: most of what it holds
+releases in seconds.** §4.3 is the ladder; the size of the claim is not the thing to judge it by.
 
+- **Of ten GPUs, at most two are expensive to lose.** Batch workers claim one item at a time by
+  atomic rename, so killing one mid-item costs that item, not the pass. Overflow replicas hold no
+  session, because the local proxy moves callers. Both surrender in seconds.
+- **`reserve_free_nodes: 1`.** We never take the last free GPU in the partition, pending job or not.
+  One GPU of ten, and a colleague's interactive job then never waits on us at all. Cheapest goodwill
+  available; it should be in from the first commit.
 - **compute306 is used, not camped on.** A multi-user service on the only node that can hold the
-  model is the intended use of that hardware. Hold it with a real walltime, publish the status, and
+  model is the intended use of that hardware. Hold it with a real walltime, publish the status,
   release it when idle.
-- **Tier 2 costs 27 minutes to restart** (372 GB at a measured 230 MB/s), so it yields reluctantly
-  and its idle timeout is **180 minutes**, not 30. A 27-minute asset released over a lunch break is
-  the thrashing `DESIGN.md` §10 warns about.
-- **Tier 1 costs minutes, so it is the rung that gets pulled.** The yield ladder finally has more
-  than one rung again: idle tier-3 replica, then tier 1, then tier 2 last.
+- **The specialist costs 27 minutes to restart** (372 GB at a measured 230 MB/s), so it yields
+  reluctantly and its idle timeout is **180 minutes**, not 30. A 27-minute asset released over a
+  lunch break is the thrashing `DESIGN.md` §10 warns about.
 - The yield predicate is unchanged and the **`BeginTime` filter is still the load-bearing part** —
   every pending job on this cluster on 2026-09-09 was `BeginTime`, not `Resources`.
-- **Fair-share.** Tier 1 bills ~92 CPUs and 4 GPUs; tier 2 bills ~92 CPUs and 1 GPU. This is no
-  longer a rounding error against our own pipeline jobs and must be measured before and during
-  (`DESIGN.md` §13).
+- **Fair-share is the real cost and it scales with the pool.** The specialist alone bills ~92 CPUs;
+  vLLM replicas are far lighter, but every GPU-hour counts and a pool that soaks up idle capacity
+  overnight bills for all of it. **Measure our fair-share factor before and during a week of
+  operation** (`DESIGN.md` §13). If it moves, the batch tier is what shrinks — it is the only tier
+  with no human waiting on it.
 
 ---
 
@@ -669,8 +730,10 @@ otherwise be iterating.
 
 1. **Does tier 1 bind the cluster network?** It must, to serve more than one node. That is an
    explicit weakening of the loopback control (§6). Tier 3 stays socket-free regardless.
-2. **Is compute306 entire, plus one c3 node, an acceptable standing claim?** That is the real
-   footprint. If not, tier 1 shrinks to a single-GPU model and the quality target moves with it.
+2. **How much of the pool may the fleet hold?** §4.4 proposes up to 3 `c3` nodes for interactive
+   work, compute306 for tier 1, batch workers on whatever remains, and **never the last free GPU**.
+   Batch workers are the greedy-looking part and the cheapest to give back — if the objection is
+   optics rather than impact, cap them explicitly and say so in the README.
 3. **Which tier-1 model?** §4.2 makes this task one of P1 rather than a guess in a document.
 4. **Which client does `fleet` open?** Not *whether* to write an adapter — §6.1 settled that: the
    local proxy has to exist anyway, and translating between the OpenAI and Anthropic shapes inside
