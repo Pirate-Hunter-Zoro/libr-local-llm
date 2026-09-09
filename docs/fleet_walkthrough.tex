@@ -4,7 +4,6 @@
 \usepackage[T1]{fontenc}
 \usepackage{lmodern}
 \usepackage{booktabs}
-\usepackage{amsmath}
 \usepackage{xcolor}
 \usepackage{tikz}
 \usetikzlibrary{arrows.meta,positioning,fit,backgrounds}
@@ -16,13 +15,14 @@
   \begin{center}
   \colorbox{black!8}{\parbox{0.92\textwidth}{\centering #1}}
   \end{center}}
+\newcommand{\goodbox}[1]{%
+  \begin{center}
+  \colorbox{green!12}{\parbox{0.92\textwidth}{\centering #1}}
+  \end{center}}
 
-\newcommand{\meas}{{\color{blue!55!black}\textbf{measured}}}
-\newcommand{\proj}{{\color{orange!75!black}\textbf{projected}}}
-
-\title{Getting Close}
-\subtitle{A tiered local inference service --- how fast it can really go, and why}
-\author{\texttt{libr-local-llm} --- the next phase}
+\title{A Private AI Assistant For The Lab}
+\subtitle{What we can build, how fast it will feel, and what it will cost}
+\author{\texttt{libr-local-llm}}
 \date{}
 
 \begin{document}
@@ -30,587 +30,383 @@
 \frame{\titlepage}
 
 %----------------------------------------------------------
-\begin{frame}{The answer, before the argument}
+\begin{frame}{The idea, in one sentence}
 
-\begin{center}
-\small
-\renewcommand{\arraystretch}{1.2}
-\begin{tabular}{@{}lccc@{}}
-\toprule
-& \textbf{hosted} & \textbf{tier 1 --- daily driver} & \textbf{tier 2 --- consultant} \\
-\midrule
-speed & 50--100 tok/s & \textbf{20--40 tok/s} \proj & 8--12 tok/s \proj \\
-concurrent users & many & \textbf{many} & \textbf{one} \\
-model & frontier & $\sim$200--250B MoE, int4 & \textbf{744B}, int4 \\
-may read PHI & \textbf{never} & \textbf{yes} & \textbf{yes} \\
-\bottomrule
-\end{tabular}
-\end{center}
+\goodbox{\large Put an AI assistant \textbf{on the lab's own computers}, so several people can use
+it at once --- and so it is allowed to read patient data, which no outside service ever will be.}
 
-\vspace{0.7em}
-\keybox{\textbf{Tier 1 is the answer to the actual question.} Several people, each in their own
-VSCode terminal, at within a small factor of the hosted experience. \textbf{Tier 2 is where the
-744B lives} --- reached by an explicit tool call when a question deserves it, not the thing you type
-at.}
-
-\vspace{0.6em}
-{\small What you cannot have is the 744B itself at conversational speed for everyone. That is not a
-tuning failure. It is a property of how the model routes, and slide 5 is the arithmetic.}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{Why a 744B model runs on a machine that cannot hold it}
-
-A 744B mixture-of-experts activates only about \textbf{40B parameters per token} --- and only the
-\emph{routed experts} change from one token to the next.
-
-\begin{center}
-\resizebox{0.95\textwidth}{!}{%
-\begin{tikzpicture}[
-  font=\scriptsize, >={Stealth[length=2mm]},
-  tier/.style={rounded corners=3pt, align=center, inner sep=5pt, minimum height=13mm},
-  lbl/.style={font=\tiny, inner sep=1.5pt}
-]
-\node[tier, draw=green!45!black, thick, fill=green!14, minimum width=32mm] (v) at (0,0)
-  {\textbf{VRAM} --- A40, 46\,GB\\[2pt]dense + attention + KV\\$\approx$23\,GB};
-\node[tier, draw=blue!55!black, thick, fill=blue!12, minimum width=42mm] (r) at (6.6,0)
-  {\textbf{RAM} --- 1\,TB on every node\\[2pt]\textbf{all 19,456 routed experts}\\372\,GB, fully resident};
-\node[tier, draw=black!45, fill=black!6, minimum width=32mm] (d) at (13.4,0)
-  {\textbf{disk} --- the studies share\\[2pt]cold start only\\\textbf{0\,MB/s during decode}};
-\draw[->, thick, black!60] (d) -- node[lbl, above] {read once, at startup} (r);
-\draw[<->, very thick, blue!55!black] (r) -- node[lbl, above] {12.1\,GB per token} (v);
-\end{tikzpicture}}
-\end{center}
-
-\vspace{0.3em}
-\textbf{Think of it as a JIT, but for weights.} A compiler JIT never compiles the whole program --- it
-watches what actually runs. colibr\`i makes the same bet: parameters are not state to be held, they
-are \textbf{data to be staged}, exactly when the router proves they are needed.
-
-\vspace{0.4em}
-{\scriptsize \textbf{Placement decides speed and nothing else.} The router's decisions and the
-weights' precision are identical whether an expert answered from VRAM or from disk.}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{Where the time actually goes: two halves, roughly equal}
-
-Measured by colibr\`i's own profiler on a \textbf{2-socket Ice Lake, 48 cores, model fully
-resident} --- our CPU class:
-
-\keybox{\parbox{0.72\textwidth}{\ttfamily\small
-4.68 tok/s\hfill = 214 ms per token \\[0.3em]
-\hspace*{1em}expert read: 12.1 GB / 131.9 GB/s\hfill = \ \ 92 ms\quad(43\%) \\
-\hspace*{1em}attention, dense, router, orchestration\hfill = 122 ms\quad(57\%)}}
-
-\vspace{0.7em}
-An independent profile on different hardware agrees: expert-matmul 46\%, attention 26\%.
-
-\vspace{0.6em}
-\keybox{\textbf{This is the fact that reshaped the design.} There is no single bottleneck. Optimise
-either half perfectly and Amdahl caps you \textbf{under 2$\times$}. Every plan that attacked one
-half --- more GPUs, more RAM, faster disk --- was aiming at at most half the problem.}
-
-\vspace{0.5em}
-{\scriptsize The obvious next move is to produce several tokens per pass, so the 57\% is paid once
-for many tokens. That is what batching and speculation do, and it is the next slide.}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{Why batching and speculation both fail --- the deep result}
-
-{\small GLM-5.2 routes \textbf{top 8 of 256} experts per layer. Processing $B$ tokens in one pass
-reads the \textbf{union}: $\;256 \times (1 - (1 - 8/256)^{B})$.}
-
-\begin{center}
-\scriptsize
-\begin{tabular}{@{}rrrl@{}}
-\toprule
-\textbf{batch} & \textbf{experts} & \textbf{bytes} & \\
-\midrule
-1 & 8.0 & 1.0$\times$ & one token \\
-5 & 37.6 & \textbf{4.7$\times$} & speculation depth 4 \\
-8 & 57.4 & \textbf{7.2$\times$} & eight users \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\vspace{0.2em}
-{\small\textbf{The union grows almost linearly.} The 43\% expert half does not amortise --- only
-the 57\% half does. \textbf{And colibr\`i ran this experiment under full residency}, so it is
-\meas, not predicted:}
-
-\vspace{0.2em}
-\begin{center}
-\scriptsize
-\begin{tabular}{@{}rrrl@{}}
-\toprule
-\textbf{sessions} & \textbf{aggregate} & \textbf{per session} & \\
-\midrule
-1 & 4.84 & \textbf{4.84} & \\
-4 & 8.14 & 2.04 & saturated already \\
-8 & \textbf{8.30} & \textbf{1.04} & \emph{below} that host's 8.90 single-stream baseline \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\vspace{0.2em}
-\keybox{\small \textbf{You cannot batch your way to a fast frontier model here.} Multi-user speed
-has to come from a \textbf{different model}, not a different setting. Hence three tiers.}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{Two things the last version of this deck got wrong}
-
+\vspace{1.0em}
 \begin{columns}[T]
-\begin{column}{0.48\textwidth}
-{\small\textbf{1. ``colibr\`i is single-user.''}\\[0.3em]
-It is not. \texttt{SERVE\_BATCH=1} selects a
-\textbf{continuous-batching} scheduler with up to 16 KV slots --- \emph{``every active slot
-contributes one row per forward.''}
-
-\vspace{0.4em}
-The 1.32 / 1.51 / 1.46 tok/s figure I quoted was measured on a host where \textbf{the experts were
-not resident}, so extra slots thrashed the cache. It does not transfer.
-
-\vspace{0.4em}
-It still does not rescue us --- but for the union reason on the previous slide, not this one.}
+\begin{column}{0.47\textwidth}
+{\large\textbf{Today}}\\[0.4em]
+{\small You use Claude. It is excellent and fast. But every word you send leaves the building, so
+it can never touch a patient recording or transcript.}
 \end{column}
-\begin{column}{0.48\textwidth}
-{\small\textbf{2. ``Four GPUs are worth under 2\%.''}\\[0.3em]
-That A/B ran on a host pulling \textbf{19.7 GB/s of an available 85} --- 23\% of the machine.
-Placement could not matter, because the CPU could not consume faster from either tier.
-
-\vspace{0.4em}
-On a host that pulls \textbf{131.9 GB/s} the question reopens: A40 memory is $\sim$696 GB/s, so
-experts in VRAM arrive \textbf{$\sim$5$\times$ faster} than from RAM.
-
-\vspace{0.4em}
-\textbf{Corrected: open, and a measurement we owe.} Possibly worth 1.6$\times$ on the expert half.}
+\begin{column}{0.47\textwidth}
+{\large\textbf{What this would add}}\\[0.4em]
+{\small An assistant living on our own machines. A bit slower. Not quite as clever. But it can look
+at the actual data, because nothing ever leaves.}
 \end{column}
 \end{columns}
 
-\vspace{0.6em}
-\keybox{Both errors came from carrying somebody else's measurement onto different hardware without
-checking what limited it. That is the trap colibr\`i's own experiment log spends a whole section
-warning about.}
+\vspace{1.0em}
+\keybox{This is \textbf{not} a replacement for Claude. It is a second tool that can go where Claude
+is not allowed to go.}
 
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{The architecture: three tiers on different hardware}
+\begin{frame}{First, the one idea everything else depends on}
 
+An AI model is basically a gigantic pile of numbers. Ours would be a very big pile: \textbf{744
+billion of them}. Far too big to keep somewhere fast and convenient.
+
+\vspace{0.5em}
+\keybox{\textbf{Think of it as a library.} The model is a library with about \textbf{19,000 books}.
+To produce even one word of an answer, it does not read the whole library --- it fetches a small
+handful of books, reads them, and puts them back.}
+
+\vspace{0.5em}
 \begin{center}
-\resizebox{0.78\textwidth}{!}{%
-\begin{tikzpicture}[
-  font=\scriptsize, >={Stealth[length=2mm]},
-  usr/.style={draw=black!45, rounded corners=3pt, fill=black!7, align=center,
-              inner sep=4pt, minimum height=11mm, minimum width=30mm},
-  t1/.style={draw=blue!55!black, very thick, fill=blue!12, align=center,
-             inner sep=4pt, minimum height=17mm, minimum width=58mm},
-  t2/.style={draw=green!45!black, very thick, fill=green!12, align=center,
-             inner sep=4pt, minimum height=17mm, minimum width=58mm},
-  t3/.style={draw=black!50, thick, fill=black!5, align=center,
-             inner sep=4pt, minimum height=11mm, minimum width=58mm},
-  flow/.style={->, very thick, draw=black!75},
-  lbl/.style={font=\tiny, inner sep=1.5pt}
-]
-\node[usr] (u) at (0,0.4) {\textbf{several people}\\ssh + VSCode terminal\\any node};
-\node[t1] (a) at (7.6,1.9) {\textbf{TIER 1 --- the daily driver}\\vLLM on compute306, 4$\times$A40 TP=4\\$\sim$200--250B MoE at int4 ($\sim$120\,GB)\\\textbf{continuous batching, MANY USERS}\\\textbf{20--40 tok/s each}};
-\node[t2] (b) at (7.6,-1.4) {\textbf{TIER 2 --- the consultant}\\colibr\`i on one \texttt{c3} node\\GLM-5.2 744B int4, 372\,GB\\\texttt{KV\_SLOTS=1} + speculation\\\textbf{8--12 tok/s, one at a time}};
-\node[t3] (c) at (0,-2.9) {\textbf{TIER 3 --- batch corpus work}\\vLLM replicas, filesystem queue\\\textbf{no socket at all} --- PSYCH-ASR};
-\draw[flow] (u.east) -- node[lbl, above, sloped] {the agent loop lives here} (a.west);
-\draw[flow, draw=green!45!black] (a.south) -- node[lbl, right, align=left] {one explicit\\``ask the big\\model'' tool call} (b.north);
-\node[lbl, text=black!55, align=center, below=2pt of c] {shares no caller with tier 1 --- \textbf{so no router is needed}};
-\end{tikzpicture}}
+\begin{tikzpicture}[font=\small]
+\node[draw=green!45!black, thick, fill=green!14, rounded corners, minimum width=3.1cm,
+      minimum height=1.5cm, align=center] (a) at (0,0) {\textbf{On the desk}\\tiny, instant};
+\node[draw=blue!55!black, thick, fill=blue!12, rounded corners, minimum width=3.1cm,
+      minimum height=1.5cm, align=center] (b) at (4.2,0) {\textbf{On the shelves}\\big, quick};
+\node[draw=black!45, fill=black!6, rounded corners, minimum width=3.1cm,
+      minimum height=1.5cm, align=center] (c) at (8.4,0) {\textbf{In the basement}\\huge, slow};
+\node[font=\scriptsize, text=black!60, below=2pt of a] {a few books};
+\node[font=\scriptsize, text=black!60, below=2pt of b] {\textbf{all 19,000 fit here}};
+\node[font=\scriptsize, text=black!60, below=2pt of c] {we avoid this};
+\end{tikzpicture}
 \end{center}
 
-\vspace{-0.1em}
-{\scriptsize \textbf{An agent loop makes dozens of cheap calls and a few expensive ones.} Routing
-all of them through a 10 tok/s model wastes both the model and the person. Escalation is
-\textbf{explicit} --- automatic quality-based cascade is research-grade and unreliable.}
+\vspace{0.5em}
+\goodbox{\small \textbf{Good news, and the reason this project is possible at all:} our computers
+have enough shelf space for \emph{the entire library}. The assistant never goes to the basement
+while answering you.}
 
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{Tier 1 --- and why it is not the model you already rejected}
+\begin{frame}{Why it is slow: 600 trips to the shelf, per word}
 
+Here is the whole speed problem, and there is no trick that makes it go away.
+
+\vspace{0.6em}
+\begin{center}
+\begin{tikzpicture}[font=\small, >={Stealth[length=2.5mm]}]
+\node[draw=black!40, fill=black!5, rounded corners, minimum width=2.4cm, minimum height=1.1cm,
+      align=center] (w) at (0,0) {\textbf{one word}};
+\node[draw=blue!55!black, thick, fill=blue!12, rounded corners, minimum width=3.4cm,
+      minimum height=1.1cm, align=center] (l) at (4.6,0) {\textbf{75 floors}\\to walk};
+\node[draw=blue!55!black, thick, fill=blue!12, rounded corners, minimum width=3.4cm,
+      minimum height=1.1cm, align=center] (b) at (9.6,0) {\textbf{8 books}\\on each floor};
+\draw[->, thick] (w) -- (l);
+\draw[->, thick] (l) -- (b);
+\end{tikzpicture}
+\end{center}
+
+\vspace{0.6em}
+\keybox{\Large 75 floors $\times$ 8 books = \textbf{600 book-fetches for every single word.}}
+
+\vspace{0.8em}
+Everything about the design comes from trying to make those 600 trips faster. We can shorten the
+walk. We can put the most-used books nearer. We \textbf{cannot} avoid the trips --- that is simply
+how this kind of model works.
+
+\vspace{0.6em}
+{\small And the fetching is only \emph{half} the work. The other half is the thinking it does once
+it has the books. Even if we made the fetching instant, we would only be about \textbf{twice} as
+fast. Worth knowing before anyone promises ten times.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{The obvious fix that does not work}
+
+{\small \textbf{The obvious idea:} if eight people ask at the same time, fetch everyone's books in
+\emph{one} trip. Serve eight for the price of one. It fails, and the reason is simple:}
+
+\keybox{\small \textbf{Eight people want eight \emph{different} sets of books.} One trip for 8 books
+becomes one trip for about \textbf{57} --- and you are still only serving eight people.}
+
+\vspace{0.4em}
 \begin{center}
 \small
-\begin{tabular}{@{}lll@{}}
+\begin{tabular}{@{}rrl@{}}
 \toprule
-& \textbf{what you tried} & \textbf{tier 1} \\
+\textbf{People at once} & \textbf{Books to fetch} & \\
 \midrule
-model & \texttt{qwen3-coder:30b} & a $\sim$200--250B MoE, $\sim$20B active \\
-quantization & q4 GGUF & int4 AWQ or GPTQ/Marlin \\
-server & ollama, defaults & vLLM, continuous batching, full context \\
-parameters & 30B & \textbf{roughly eight times as many} \\
-hardware & one A40 & \textbf{four A40s, 184\,GB} \\
+1 & 8 & \\
+4 & 33 & barely better than doing them one by one \\
+8 & 57 & \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\vspace{0.7em}
-\keybox{\textbf{compute306 finally has a defensible use.} 184\,GB of VRAM is the only place on this
-cluster a $\sim$120\,GB model fits, and a service for \emph{everybody} is worth the only four-GPU
-node in a way a single-user one never was. This reverses the previous recommendation --- because
-the node is now serving the whole lab.}
+\vspace{0.4em}
+{\small \textbf{This was actually tested}, not guessed. With eight people the group finished no
+faster in total --- and each person waited \textbf{about five times longer} than going alone.}
 
-\vspace{0.5em}
-{\scriptsize \textbf{Two open items, both real.} The exact checkpoint is task one of the build, not
-a guess in a slide --- it must fit 184\,GB minus KV, be int4 (\textbf{Ampere has no FP8}), and
-support tool calling. And tensor parallelism across four cards pays a PCIe all-reduce every layer,
-because \textbf{NVLink reports all links inactive}: two TP=2 replicas may beat one TP=4. Measure it.}
+\vspace{0.4em}
+\goodbox{\small \textbf{The conclusion:} a giant model cannot serve a crowd quickly. For a crowd you
+need a \textbf{smaller} model. That is why we build more than one.}
 
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{Tier 2 --- squeezing the 744B, honestly}
+\begin{frame}{So: three helpers, not one}
 
 \begin{center}
-\small
-\begin{tabular}{@{}lrrrr@{}}
-\toprule
-\textbf{Configuration} & \textbf{expert} & \textbf{other} & \textbf{total} & \textbf{tok/s} \\
-\midrule
-\meas\ CPU only, fully resident, \texttt{XEXP=1} & 92 ms & 122 ms & 214 ms & \textbf{4.68} \\
-$+$ \texttt{CUDA\_DENSE=1} on one A40 & 92 & $\sim$61 & 153 ms & $\sim$6.5 \\
-$+$ four A40s (VRAM expert tier) & $\sim$55 & $\sim$61 & 116 ms & $\sim$8.6 \\
-$+$ MTP speculation at \texttt{KV\_SLOTS=1} & --- & --- & --- & \textbf{$\sim$10--12} \\
-\midrule
-\emph{or} cluster mode across 6 nodes & $\sim$34 & $\sim$61 & 95 ms & $\sim$10.5 \\
-\bottomrule
-\end{tabular}
+\begin{tikzpicture}[font=\small, >={Stealth[length=2.5mm]}]
+\node[draw=black!40, fill=black!7, rounded corners, minimum width=2.4cm, minimum height=1.3cm,
+      align=center] (u) at (-0.6,0) {\textbf{you}\\(and colleagues)};
+\node[draw=blue!55!black, very thick, fill=blue!12, rounded corners, minimum width=6.4cm,
+      minimum height=1.6cm, align=center] (a) at (5.8,1.3)
+      {\textbf{THE EVERYDAY HELPER}\\quick, clever, \emph{serves everyone at once}};
+\node[draw=green!45!black, very thick, fill=green!14, rounded corners, minimum width=6.4cm,
+      minimum height=1.6cm, align=center] (b) at (5.8,-1.2)
+      {\textbf{THE SPECIALIST}\\the giant model --- slow, deep, \emph{one person at a time}};
+\draw[->, very thick] (u.east) -- node[font=\scriptsize, above, sloped] {you talk to this one} (a.west);
+\draw[->, very thick, green!45!black] (a.south) -- node[font=\scriptsize, right, align=left]
+      {and it asks the\\specialist when\\a question is hard} (b.north);
+\end{tikzpicture}
 \end{center}
 
-\vspace{0.6em}
-\textbf{Only the first row is measured.} Everything below it is a modelled multiplier built from
-measured parts, and the campaign replaces them.
-
-\vspace{0.5em}
-\begin{itemize}\small
-\item \texttt{CUDA\_DENSE=1} attacks the 57\% half. \meas\ $\times$2.8 elsewhere, and
-      \textbf{undocumented in colibr\`i's public README}.
-\item Speculation and multi-slot are \textbf{mutually exclusive} in the engine. Tier 2 is not
-      batching anyway --- so take the speculation.
-\end{itemize}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{Cluster mode --- real, and not yet ready}
-
-{\small colibr\`i can shard experts \emph{across machines}. The coordinator keeps generation,
-routing and KV local; expert workers on other nodes run the routed FFNs. \textbf{Only activations
-cross the wire} --- about 24\,MB per token.}
-
-\begin{center}
-\resizebox{0.52\textwidth}{!}{%
-\begin{tikzpicture}[
-  font=\scriptsize, >={Stealth[length=2mm]},
-  co/.style={draw=blue!55!black, thick, fill=blue!12, align=center, inner sep=4pt,
-             minimum height=13mm, minimum width=34mm},
-  wk/.style={draw=green!45!black, thick, fill=green!12, align=center, inner sep=3pt,
-             minimum height=9mm, minimum width=34mm},
-  lbl/.style={font=\tiny, inner sep=1.5pt}
-]
-\node[co] (c) at (0,0) {\textbf{coordinator}\\routing + KV + attention\\1 GPU};
-\node[wk] (w1) at (6.4,1.5)  {worker 1 --- experts $\equiv$ 1};
-\node[wk] (w2) at (6.4,0.0)  {worker 2 --- experts $\equiv$ 2};
-\node[wk] (w3) at (6.4,-1.5) {worker \emph{N} --- 372/\emph{N}\,GB each};
-\draw[<->, thick] (c) -- node[lbl, above, sloped] {activations only} (w1);
-\draw[<->, thick] (c) -- (w2);
-\draw[<->, thick] (c) -- (w3);
-\node[lbl, text=black!55, align=center] at (0,-1.7) {expert $e$, layer $\ell$\\$\to$ worker $(e+\ell)\bmod N$};
-\end{tikzpicture}}
-\end{center}
-
-\vspace{0em}
-{\scriptsize \textbf{The fabric supports it:} \texttt{mlx5\_1} is a \textbf{40 Gb/s Mellanox link,
-ACTIVE}. Six nodes reading their own slice in parallel would cut the expert phase from 92\,ms to
-about 34.}
+\vspace{0.4em}
+\keybox{\small \textbf{Like a good office.} You talk to the capable colleague who is always there.
+When something genuinely difficult comes up, \emph{they} ask the world expert down the hall and come
+back with the answer.}
 
 \vspace{0.3em}
-\keybox{\scriptsize \textbf{Three reasons it is P5, not P1.} The worker loop is
-\textbf{synchronous} --- $75 \times N$ sequential round trips per token, and fixing it is an
-upstream patch. A worker failure calls \texttt{exit(1)}, so one yielded node kills the service. And
-\textbf{activations cross the network in plaintext}, which for PHI-derived hidden states is a new
-exposure, not a config detail.}
+{\small A \textbf{third} helper runs overnight, grinding through big piles of paperwork --- scoring
+thousands of transcripts. Nobody talks to it.}
 
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{What you actually type}
+\begin{frame}{Helper 1 --- the everyday one}
 
-colibr\`i speaks the \textbf{Anthropic Messages API} natively, so tier 2 needs no shim:
-
-\keybox{\parbox{0.66\textwidth}{\ttfamily\small
-export ANTHROPIC\_BASE\_URL=http://\emph{node}:8000 \\
-export ANTHROPIC\_API\_KEY=\emph{your key} \\
-claude}}
-
-\vspace{0.5em}
 \begin{center}
-\scriptsize
+\small
 \begin{tabular}{@{}ll@{}}
 \toprule
-\textbf{Command} & \textbf{What happens} \\
-\midrule
-\texttt{fleet code} & sets the environment, starts your client against tier 1 \\
-\texttt{fleet ask "\ldots"} & one question, escalated to tier 2, you wait a minute \\
-\texttt{fleet status} & what is up, what is warm, what it is waiting on \\
-\texttt{fleet up} / \texttt{fleet down} & start the supervisor / stop everything and stay stopped \\
+\textbf{How big} & about a third the size of the specialist --- still very large \\
+\textbf{Where it lives} & our one machine with four graphics cards \\
+\textbf{How many people} & \textbf{everybody, at the same time} \\
+\textbf{How fast} & roughly \textbf{a page of text every 20--30 seconds} \\
+\textbf{What it is for} & \textbf{almost everything you do all day} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\vspace{0.5em}
-\keybox{\small \textbf{Multi-user changes the security question, and it must be faced.} A loopback
-bind means one user per node, which defeats the point --- so tier 1 binds the cluster interface
-\textbf{with an API key}. That is a deliberate, recorded weakening of the current control.
-\textbf{Tier 3 keeps no socket at all}, which is why PHI corpus work stays there.}
+\vspace{0.8em}
+\keybox{\textbf{Why this one can serve a crowd and the specialist cannot:} it is small enough to
+live entirely on the graphics cards, which are enormously faster than the shelves. The book-fetching
+stops being the problem, so serving several people at once genuinely does work here.}
+
+\vspace{0.8em}
+{\small We have not picked exactly which model yet --- that is the first real job. It has to fit on
+the four cards, be good at code, and be able to use tools. \textbf{It is not the small model that
+was tried and rejected earlier}: this one has roughly eight times as many numbers in it and runs on
+much better software.}
 
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{Restarting itself, and the switch that stops it}
+\begin{frame}{Helper 2 --- the specialist}
 
 \begin{center}
-\resizebox{0.78\textwidth}{!}{%
-\begin{tikzpicture}[
-  font=\scriptsize, >={Stealth[length=2mm]},
-  gen/.style={draw=blue!55!black, thick, fill=blue!12, align=center, inner sep=4pt,
-              text width=24mm, minimum height=12mm},
-  pend/.style={draw=black!45, dashed, rounded corners=3pt, fill=black!5, align=center,
-               inner sep=4pt, text width=24mm, minimum height=12mm},
-  kill/.style={draw=red!70!black, thick, fill=red!10, align=center, inner sep=4pt,
-               text width=26mm, minimum height=11mm},
-  flow/.style={->, thick, draw=black!70}, lbl/.style={font=\tiny, inner sep=1.5pt}
-]
-\node[gen]  (g1) at (0,0)    {\textbf{generation 1}\\running};
-\node[pend] (g2) at (4.0,0)  {\textbf{generation 2}\\queued, waiting};
-\node[pend] (g3) at (8.0,0)  {\textbf{generation 3}\\queued, waiting};
-\node[kill] (k)  at (4.0,-2.3) {\textbf{\texttt{fleet down}}\\writes \texttt{STOP}, then cancels};
-\draw[flow] (g1) -- node[lbl, above] {submits at birth}
-                   node[lbl, below] {\texttt{-{}-dependency=afterany}} (g2);
-\draw[flow] (g2) -- (g3);
-\draw[flow, draw=red!70!black] (k) -- node[lbl, right] {checked first, always} (g2);
-\node[lbl, text=black!55, align=center] at (0,-1.5) {dies for \emph{any} reason:\\walltime, crash,
-node failure, \texttt{scancel}};
-\draw[->, black!45, dashed] (0,-1.1) -- (0,-0.65);
-\end{tikzpicture}}
-\end{center}
-
-\vspace{0.2em}
-{\small \textbf{Each generation submits its successor the moment it starts}, with a dependency that
-fires on \emph{any} termination. A pending job costs nothing, so the queued successor is free
-insurance.}
-
-\vspace{0.2em}
-\keybox{\scriptsize \textbf{The kill switch is a file, not a signal.} \texttt{fleet down} writes
-\texttt{STOP} \emph{before} it cancels anything, so the successor starts, reads it, and exits in two
-seconds. It works when the supervisor is wedged and when its node is gone.}
-
-\vspace{0.1em}
-{\scriptsize One tier-2 change: \textbf{readiness is a generated token, not a listening socket} ---
-the model takes 27 minutes to load, and an ollama-sized timeout fires at 3\% of the way through.}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{Citizenship --- the ask is now large, and has to be argued}
-
-The standing claim is \textbf{compute306 entire, plus one \texttt{c3} node}. Bigger than either
-earlier plan. What makes it defensible:
-
-\begin{itemize}\small
-\item \textbf{compute306 is used, not camped on.} It is the only node that can hold the tier-1
-      model, and it now serves everybody rather than one person.
-\item \textbf{Tier 1 is the rung that gets pulled.} It costs minutes to restart, so it is what the
-      fleet yields --- the ladder has more than one rung again.
-\item \textbf{Tier 2 costs \meas\ 27 minutes} to reload 372\,GB at 230\,MB/s, so its idle timeout is
-      \textbf{three hours}, not thirty minutes. A 27-minute asset released over a lunch break is
-      thrashing, and a fleet that thrashes is worse than a fleet that is simply smaller.
-\item \textbf{The yield filter is still the load-bearing part.} On the day this was written,
-      \textbf{all 27} pending jobs on the cluster were waiting on a start time they had asked for
-      --- not on resources. A naive rule would surrender everything, continuously, for nothing.
-\end{itemize}
-
-\vspace{0.4em}
-\keybox{\small \textbf{Fair-share is no longer a rounding error.} Tier 1 bills $\sim$92 CPUs and
-four GPUs; tier 2 bills $\sim$92 CPUs and one. That lands on the PSYCH-ASR and TRD-EHR jobs this
-exists to serve, and it must be measured before and during --- not asserted to be fine.}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{The measurement campaign --- this is what decides the design}
-
-\begin{center}
-\scriptsize
-\renewcommand{\arraystretch}{1.15}
-\begin{tabular}{@{}rp{0.50\textwidth}p{0.34\textwidth}@{}}
+\small
+\begin{tabular}{@{}ll@{}}
 \toprule
-& \textbf{Test} & \textbf{Settles} \\
-\midrule
-1--3 & build with \texttt{ARCH=native}; stage 372\,GB; time a cold load, then a restart on the same node & the VNNI kernels, and whether 1\,TB of page cache kills the 27 minutes \\
-4 & \texttt{coli plan}, then \texttt{coli tune}, under the snapshot protocol & the real tok/s, plus OpenMP and NUMA \\
-5 & A/B \texttt{CUDA\_DENSE=1} & how much of the 57\% the GPU takes \\
-6 & \textbf{A/B one A40 against four} & the question the last version closed too early \\
-7 & A/B \texttt{XEXP}, NUMA binding, MTP depth & the remaining tier-2 levers \\
-8 & vLLM TP=4 against 2$\times$TP=2 & the PCIe all-reduce tax \\
-9 & \textbf{tier 1 under six concurrent users} & \textbf{the number this whole project is for} \\
+\textbf{How big} & \textbf{744 billion} --- the biggest thing we can run at all \\
+\textbf{Where it lives} & one ordinary machine, using most of its memory \\
+\textbf{How many people} & \textbf{one at a time.} Others wait in line \\
+\textbf{How fast} & roughly \textbf{a page of text per minute} \\
+\textbf{What it is for} & the hard question you would otherwise be stuck on \\
 \bottomrule
 \end{tabular}
 \end{center}
+
+\vspace{0.7em}
+\keybox{\textbf{One catch worth planning around.} Waking it up means reading 372 gigabytes off the
+shared storage. That takes about \textbf{27 minutes}. So we wake it in the morning and leave it
+awake, rather than starting it on demand.}
 
 \vspace{0.6em}
-\keybox{\textbf{And one protocol rule that is not optional.} colibr\`i keeps a learned routing
-profile on disk that survives restarts. A byte-for-byte \emph{identical} configuration measured
-\textbf{5.46 tok/s and then 2.56}. Snapshot and restore that file before every single
-configuration, or you are measuring the profile rather than the change.}
+{\small It is slow because it is enormous, and it is worth having \emph{because} it is enormous.
+A minute of waiting for a genuinely hard answer is a good trade. A minute of waiting to rename a
+variable is not --- which is exactly why helper 1 exists.}
 
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{How good will it be --- and how do we know a question is hard?}
-
-\begin{columns}[T]
-\begin{column}{0.48\textwidth}
-{\small\textbf{Where open models are closest}
-\begin{itemize}\small
-\item running commands, reading output
-\item iterating on a compile error
-\item writing prose to a house style
-\item single-step tool use, search
-\end{itemize}}
-\end{column}
-\begin{column}{0.48\textwidth}
-{\small\textbf{Where the gap opens, worst last}
-\begin{itemize}\small
-\item long-context synthesis across many files
-\item deciding \emph{what to look for}
-\item noticing an absence nobody flagged
-\item \textbf{holding a position under pushback}
-\end{itemize}}\vspace{-0.4em}
-\end{column}
-\end{columns}
-
-\vspace{0.4em}
-\keybox{\scriptsize \textbf{Do not ask the model whether the question is hard.} Confidence
-calibration is poor, and worse at int4 --- a model that does not know what it does not know is
-precisely the failure this would need to detect. And int4 damage \textbf{concentrates on the
-hardest questions}, because per-row scales erode the small logit margins those depend on.}
-
-\vspace{0.3em}
-\begin{center}
-\scriptsize
-\begin{tabular}{@{}p{0.30\textwidth}p{0.42\textwidth}p{0.20\textwidth}@{}}
-\toprule
-\textbf{What works instead} & \textbf{Trigger} & \textbf{Cost} \\
-\midrule
-you escalate & you type \texttt{fleet ask} & you must know \\
-\textbf{observable loop signals} & \textbf{tool calls past N; same file edited 3+ times; a test failing twice} & \textbf{needs no introspection} \\
-task shape declared up front & ``design'', ``decide between'', ``why is this slow'' & discipline \\
-second opinion on write & any artifact that outlives the session & a minute \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{The acceptance test: this session, as the benchmark}
-
-{\small The sessions that produced this deck are the right eval --- the answers are known, and they
-are on \emph{our} data rather than someone else's.}
+\begin{frame}{What it looks like to use}
 
 \begin{center}
-\scriptsize
-\renewcommand{\arraystretch}{1.2}
-\begin{tabular}{@{}rp{0.52\textwidth}p{0.32\textwidth}@{}}
-\toprule
-& \textbf{Finding it must reach unprompted} & \textbf{What that requires} \\
-\midrule
-1 & \texttt{c3} can \texttt{SIGSTOP} a server silently --- tier 20 vs tier 10, and suspend does not free VRAM & three command outputs plus outside knowledge \\
-2 & A 1-CPU ask bills 2, and memory silently buys CPUs & read one line and know why \\
-3 & \textbf{the expert union defeats batching and speculation} & derive it, having judged a cited measurement insufficient \\
-\bottomrule
-\end{tabular}
+\begin{tikzpicture}[font=\small, >={Stealth[length=2.5mm]},
+  st/.style={draw=black!45, fill=black!6, rounded corners, minimum width=2.9cm,
+             minimum height=1.5cm, align=center}]
+\node[st] (a) at (0,0)    {\textbf{1}\\log in to a\\lab computer};
+\node[st] (b) at (3.5,0)  {\textbf{2}\\open VSCode,\\like always};
+\node[st] (c) at (7.0,0)  {\textbf{3}\\type your\\question};
+\node[st, draw=green!45!black, fill=green!14] (d) at (10.5,0) {\textbf{4}\\read the\\answer};
+\draw[->, thick] (a) -- (b); \draw[->, thick] (b) -- (c); \draw[->, thick] (c) -- (d);
+\end{tikzpicture}
 \end{center}
 
-\vspace{0.4em}
-{\scriptsize \textbf{Protocol:} hand it this repository at the commit \emph{before} any of this
-planning existed, and the original prompt. Score which findings appear, how many confident false
-ones it adds --- and \textbf{whether it holds a correct position when told it is wrong.}}
-
-\vspace{0.3em}
-\keybox{\scriptsize \textbf{Weight that last column hardest.} Two of these three were wrong in an earlier
-draft and were fixed only under pushback. A system that capitulates and invents a better-sounding
-answer scores \emph{worse} than one that never found the issue.
-
-\vspace{0.3em}
-\textbf{Expected, stated in advance so the test can falsify it:} tier 1 does the routine 90\% and
-probably misses findings 1 and 3. That is still worth having --- it leaves your attention for the
-10\% that is judgement.}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{Five decisions that are yours, not mine}
-
-\begin{center}
-\scriptsize
-\renewcommand{\arraystretch}{1.2}
-\begin{tabular}{@{}p{0.48\textwidth}p{0.44\textwidth}@{}}
-\toprule
-\textbf{Question} & \textbf{Where it lands} \\
-\midrule
-Does tier 1 bind the cluster network? & \textbf{It must}, to serve more than one node --- and that
-weakens the loopback control. Tier 3 stays socket-free regardless. \\
-Is compute306 entire, plus one \texttt{c3} node, acceptable as a standing claim? & If not, tier 1
-shrinks to a single-GPU model and the quality target moves with it. \\
-Which tier-1 checkpoint? & Task one of the build. Fits 184\,GB minus KV, int4, tool calling,
-strong at code. \\
-Claude Code everywhere, or opencode for tier 1? & colibr\`i speaks Anthropic natively; vLLM does
-not. Write a thin adapter, or accept two clients. \\
-\textbf{If tier 1 measures well, is tier 2 still worth 372\,GB and a node?} & Ask again after test
-9, and after a blind side-by-side on real tasks from our own repos. \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{What ``done'' looks like}
-
-\keybox{\parbox{0.9\textwidth}{\vspace{0.3em}
-Several people ssh into compute nodes, open VSCode, and type. Each gets a strong local model at
-\textbf{20--40 tokens a second}, all at the same time, on hardware the lab already owns.
-
-When a question is genuinely hard, the agent calls one tool and a \textbf{744-billion-parameter
-model} answers it in a minute.
-
-None of it leaves the building, so all of it may read PHI.
-
-Overnight the fleet releases what it holds. If a colleague's job goes pending, it finishes the
-current answer and gives a node back --- and the log says which job, when anybody asks.
-\vspace{0.3em}}}
+\vspace{0.8em}
+\keybox{\textbf{That is the whole thing.} The same terminal window you already use. The same way of
+asking. You would not be able to tell from the screen that the answer came from down the hall
+instead of from California.}
 
 \vspace{0.8em}
 \begin{center}
-\textbf{Not as fast as hosted.} \quad \textbf{Within a small factor.} \quad \textbf{And it can read
-the data.}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\texttt{fleet code} & start working. Talks to the everyday helper \\
+\texttt{fleet ask "\ldots"} & send one hard question to the specialist and wait \\
+\texttt{fleet status} & is it running? is anyone queued? \\
+\texttt{fleet down} & stop everything \\
+\bottomrule
+\end{tabular}
 \end{center}
 
-\vspace{0.4em}
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{Being a good neighbour}
+
+These are shared computers. Other people in the lab are running their own work on them, and our
+assistant would be sitting on a fair chunk of them all day.
+
+\vspace{0.6em}
 \begin{center}
-{\small The third one is not a consolation prize. It is the only reason this is worth building.}
+\begin{tikzpicture}[font=\small, >={Stealth[length=2.5mm]},
+  st/.style={draw=black!45, fill=black!6, rounded corners, minimum width=2.5cm,
+             minimum height=1.5cm, align=center},
+  hot/.style={draw=orange!70!black, thick, fill=orange!15, rounded corners,
+              minimum width=2.5cm, minimum height=1.5cm, align=center}]
+\node[st]  (a) at (0,0)    {\textbf{1}\\a colleague's\\job is stuck};
+\node[hot] (b) at (3.2,0)  {\textbf{2}\\finish the\\answer in progress};
+\node[hot] (c) at (6.4,0)  {\textbf{3}\\hand the\\computer back};
+\node[st]  (d) at (9.6,0)  {\textbf{4}\\wait --- do not\\grab it again};
+\node[st]  (e) at (12.8,0) {\textbf{5}\\restart once\\they are running};
+\draw[->, thick] (a)--(b); \draw[->, thick] (b)--(c); \draw[->, thick] (c)--(d); \draw[->, thick] (d)--(e);
+\end{tikzpicture}
+\end{center}
+
+\vspace{0.5em}
+\keybox{\small \textbf{Step 4 is the one that matters.} Without it the system hands a computer back, notices
+a second later that it is short of computers, and grabs the same one straight back --- beating the
+very colleague it was trying to help. It would look rude while running code written to be polite.}
+
+\vspace{0.4em}
+{\small It switches itself off when nobody has used it for a few hours, and back on when someone
+does. It restarts itself if it crashes. Nobody babysits it.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{How we will know whether it is any good}
+
+{\small Speed we can measure. \textbf{Whether it is \emph{smart} enough is harder} --- and we have
+an unusually good way to test it.}
+
+\keybox{\small \textbf{Use this project as the exam.} Planning this system turned up three real
+discoveries about our own hardware that nobody had noticed. We know the answers now. Hand the local
+assistant the same starting point and see how many it finds on its own.}
+
+\vspace{0.5em}
+\begin{center}
+\scriptsize
+\begin{tabular}{@{}cl@{}}
+\toprule
+\textbf{Would we bet on it?} & \textbf{The discovery it has to make} \\
+\midrule
+maybe & one of our job queues can silently freeze the assistant mid-answer \\
+probably & asking for memory quietly charges us for twice the computers \\
+\textbf{probably not} & \textbf{why serving eight people at once cannot work} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.5em}
+{\small \textbf{Grade this hardest:} does it \emph{hold its ground} when told it is wrong? One that
+folds and invents a better-sounding answer is worse than one that never spotted the problem.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{What to expect: six people log in on Monday morning}
+
+\begin{center}
+\scriptsize
+\renewcommand{\arraystretch}{1.35}
+\begin{tabular}{@{}p{0.36\textwidth}p{0.58\textwidth}@{}}
+\toprule
+\textbf{Question} & \textbf{Honest answer} \\
+\midrule
+Can six people use it at once? & \textbf{Yes.} All six talk to the everyday helper, all at the same
+time, and it is built for exactly that. \\
+How fast for each of them? & \textbf{A page of text in 20--30 seconds.} It does not noticeably slow
+down as colleagues join. \\
+How does that compare to Claude? & Claude does that page in about \textbf{9 seconds}. So: two to
+three times slower. \textbf{Noticeable. Not painful.} \\
+What if two people need the specialist? & They \textbf{queue}. It serves one at a time, about a
+minute a page, so the second person waits about two minutes. \\
+First thing Monday? & The specialist needs \textbf{27 minutes} to wake up. We wake it before people
+arrive. \\
+Will it be as clever as Claude? & \textbf{For everyday work, close.} For long, tangled problems
+across many files --- \textbf{no}, and we should not pretend otherwise. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.3em}
+{\scriptsize Everything above is an estimate built from real measurements on similar machines. The
+first thing we build is the test that replaces these numbers with ours.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{The bottom line}
+
+\goodbox{\large \textbf{Six people. Their own terminal. A page of text every 20--30
+seconds.\\[0.25em] A genius down the hall for the hard ones.\\[0.25em] And all of it allowed to read
+the data.}}
+
+\vspace{0.7em}
+\begin{columns}[T]
+\begin{column}{0.47\textwidth}
+{\small\textbf{What we are promising}
+\begin{itemize}\small
+\item Everyone can use it at once
+\item Two to three times slower than Claude
+\item Good enough for everyday work
+\item Nothing ever leaves the building
+\item Nobody has to babysit it
+\end{itemize}}
+\end{column}
+\begin{column}{0.47\textwidth}
+{\small\textbf{What we are not promising}
+\begin{itemize}\small
+\item It will not match Claude on hard problems
+\item The specialist serves one person at a time
+\item It uses a real share of the lab's computers
+\item Every number here still needs confirming
+\end{itemize}}
+\end{column}
+\end{columns}
+
+\vspace{0.6em}
+\begin{center}
+\textbf{Slower. Not as clever. Allowed in the room where the data is.}
+
+{\small That last one is the only reason to build it --- and it is enough.}
 \end{center}
 
 \end{frame}
