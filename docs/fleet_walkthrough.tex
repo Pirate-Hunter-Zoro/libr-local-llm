@@ -1,0 +1,605 @@
+\documentclass[aspectratio=169]{beamer}
+\usetheme{Boadilla}
+\usecolortheme{seahorse}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds}
+
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{itemize items}[circle]
+
+\newcommand{\keybox}[1]{%
+  \begin{center}
+  \colorbox{black!8}{\parbox{0.92\textwidth}{\centering #1}}
+  \end{center}}
+
+\newcommand{\meas}{{\color{blue!55!black}\textbf{measured}}}
+\newcommand{\proj}{{\color{orange!75!black}\textbf{projected}}}
+
+\title{A Local Model That Behaves Itself}
+\subtitle{What the fleet is, how you use it, and what it can actually do}
+\author{\texttt{libr-local-llm} --- the next phase}
+\date{}
+
+\begin{document}
+
+\frame{\titlepage}
+
+%----------------------------------------------------------
+\begin{frame}{The whole thing in one sentence}
+
+\keybox{\large A local coding assistant that is \textbf{always there}, \textbf{gives cluster
+resources back} the moment somebody else needs them, and \textbf{restarts itself} when it dies.}
+
+\vspace{0.8em}
+Three problems it solves, all of which you have today:
+
+\begin{center}
+\small
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{@{}p{0.34\textwidth}p{0.30\textwidth}p{0.30\textwidth}@{}}
+\toprule
+\textbf{Today} & \textbf{Why it hurts} & \textbf{After} \\
+\midrule
+You run \texttt{ollama-up} by hand & nothing runs until you notice & it is already up \\
+The server holds a GPU until you kill it & you are the one being emailed & it hands the node back on its own \\
+Walltime ends, the server is gone & 9 hours, then silence & a new one takes over, no gap \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.8em}
+\textbf{And one problem it does not solve:} it is not Claude. Slide 13 is that conversation,
+and it is worth reading before the rest.
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{The system is four boxes}
+
+\begin{center}
+\resizebox{0.80\textwidth}{!}{%
+\begin{tikzpicture}[
+  font=\scriptsize,
+  >={Stealth[length=2mm]},
+  box/.style={draw=black!45, rounded corners=3pt, fill=black!7,
+              align=center, inner sep=4pt, minimum height=10mm, minimum width=24mm},
+  ctrl/.style={draw=blue!55!black, thick, fill=blue!12,
+               align=center, inner sep=4pt, minimum height=10mm, minimum width=30mm},
+  gpu/.style={draw=green!45!black, thick, fill=green!12,
+              align=center, inner sep=4pt, minimum height=8mm, minimum width=36mm},
+  kill/.style={draw=red!70!black, thick, fill=red!10,
+               align=center, inner sep=3pt, minimum height=8mm, minimum width=24mm},
+  flow/.style={->, thick, draw=black!75},
+  ask/.style={->, thick, draw=black!45, dashed},
+  lbl/.style={font=\tiny, inner sep=1.5pt}
+]
+
+\node[box, minimum height=13mm]  (you)   at (0,0.8)    {\textbf{you}\\\texttt{fleet code}\\(any node)};
+\node[ctrl, minimum height=13mm] (sup)   at (5.0,0.8)  {\textbf{the supervisor}\\a 2-CPU Slurm job\\one decision / 30\,s};
+\node[box]                       (slurm) at (5.0,-2.4) {\textbf{Slurm}\\\texttt{squeue}};
+\node[kill]                      (stop)  at (1.1,-2.4) {\textbf{kill switch}\\\texttt{STOP} file};
+
+\node[gpu] (b1) at (10.8,2.6)  {ollama, one A40\\\texttt{qwen3-coder:30b}};
+\node[gpu] (b2) at (10.8,0.8)  {ollama, compute306\\\texttt{gpt-oss:120b} (when free)};
+\node[gpu, fill=green!4, dashed] (b3) at (10.8,-1.0) {later: vLLM replicas,\\colibr\`i consultant};
+
+\begin{scope}[on background layer]
+\node[draw=green!45!black, dashed, rounded corners=4pt, inner sep=7pt,
+      fit=(b1)(b2)(b3)] (grp) {};
+\end{scope}
+\node[lbl, text=green!35!black, above=1pt of grp] {the backends --- ephemeral, replaceable};
+
+\draw[ask] (you.east) -- node[lbl, below] {which backend is warm?} (sup.west);
+\draw[ask] ([xshift=-5mm]sup.south) -- node[lbl, left, xshift=-1mm] {what do I hold?} ([xshift=-5mm]slurm.north);
+\draw[ask] ([xshift=5mm]slurm.north) -- node[lbl, right] {who else is blocked?} ([xshift=5mm]sup.south);
+\draw[flow] (sup.east) -- node[lbl, above] {start} node[lbl, below] {drain, stop} (grp.west);
+\draw[flow, draw=red!70!black] (stop.east) to[bend right=12] node[lbl, above, pos=0.18] {always wins} (sup.south west);
+\draw[flow] (you.north) to[out=75, in=165] node[lbl, above, sloped] {the prompt goes straight there} (b1.west);
+
+\end{tikzpicture}}
+\end{center}
+
+\vspace{-0.4em}
+{\scriptsize \textbf{The supervisor remembers nothing.} Every 30 seconds it asks Slurm what it
+holds and who is waiting, compares that to what it should hold, and takes \emph{one} action. A
+crashed supervisor loses no state because it kept none --- and every backend keeps serving while
+it is gone.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{What you actually type}
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Command} & \textbf{What happens} & \textbf{How long} \\
+\midrule
+\texttt{fleet code} & TUI against the local model, from anywhere & seconds, if warm \\
+\texttt{fleet code "one question"} & one-shot answer, no TUI & seconds \\
+\texttt{fleet status} & what is up, what is warm, what it is waiting on & instant \\
+\texttt{fleet up} & start the supervisor if it is not running & $\sim$30\,s \\
+\texttt{fleet up -{}-big} & also book compute306 for \texttt{gpt-oss:120b} & $\sim$5\,min cold \\
+\texttt{fleet down} & kill switch: stop everything, stay stopped & $<$30\,s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.8em}
+\keybox{\textbf{In practice you type one of these.} \texttt{fleet code}. It works from the login
+node, from a VSCode terminal on a compute node, from inside another job. It finds the server,
+steps onto its node, and opens the TUI you are already used to.}
+
+\vspace{0.5em}
+{\scriptsize The existing \texttt{ollama-up} / \texttt{ollama-code} / \texttt{ollama-down} keep
+working, untouched, the whole time. The fleet commands are additive. If the fleet breaks at 2 a.m.\
+you still have the thing that works today.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{A day in the life}
+
+\begin{center}
+\resizebox{0.95\textwidth}{!}{%
+\begin{tikzpicture}[
+  font=\scriptsize,
+  >={Stealth[length=2mm]},
+  ev/.style={draw=black!45, rounded corners=2pt, fill=black!7,
+             align=center, inner sep=3pt, text width=20mm, minimum height=11mm},
+  act/.style={draw=blue!55!black, thick, fill=blue!12,
+              align=center, inner sep=3pt, text width=20mm, minimum height=11mm},
+  give/.style={draw=orange!70!black, thick, fill=orange!15,
+               align=center, inner sep=3pt, text width=20mm, minimum height=11mm},
+  lbl/.style={font=\tiny, inner sep=1.5pt}
+]
+\draw[->, very thick, black!35] (-0.6,0) -- (13.6,0);
+
+\foreach \x/\t in {0/09:00, 2.6/11:20, 5.2/14:00, 7.8/14:35, 10.4/18:00, 13.0/09:00} {
+  \draw[black!45] (\x,0.15) -- (\x,-0.15);
+  \node[lbl, text=black!60, below=2pt] at (\x,-0.15) {\t};
+}
+
+\node[act, anchor=south]  (a)  at (0,0.35)    {you type \texttt{fleet code}\\[2pt]\textbf{TUI opens}};
+\node[ev,  anchor=north]  (b)  at (2.6,-0.55)  {you go to lunch\\[2pt]nothing sent for 30\,min};
+\node[give, anchor=south] (b2) at (2.6,0.35)   {\textbf{node released}\\idle timeout};
+\node[act, anchor=south]  (c)  at (5.2,0.35)   {you type again\\[2pt]back in $\sim$90\,s};
+\node[give, anchor=north] (d)  at (7.8,-0.55)  {a colleague's GPU job\\goes \texttt{Resources}};
+\node[give, anchor=south] (d2) at (7.8,0.35)   {\textbf{drain, then yield}\\your turn finishes first};
+\node[ev,  anchor=south]  (e)  at (10.4,0.35)  {laptop closed\\[2pt]fleet holds \textbf{zero} GPUs};
+\node[act, anchor=south]  (f)  at (13.0,0.35)  {\texttt{fleet code}\\[2pt]it comes back};
+
+\end{tikzpicture}}
+\end{center}
+
+\vspace{0.2em}
+\begin{itemize}\small
+\item \textbf{Nothing there required you to do anything} except type \texttt{fleet code} when you
+      wanted to work.
+\item \textbf{At 14:35 you did not lose your session.} The yield drains first --- the answer you
+      were waiting on finishes, \emph{then} the node goes. Session history lives on NFS home, so
+      you reattach by id from wherever you land next.
+\end{itemize}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{The one genuinely hard problem}
+
+{\small The server binds \texttt{127.0.0.1} --- loopback, on its own node. That is the control
+keeping a PHI endpoint off the cluster network. It is also why you cannot just point a client at
+it.}
+
+\begin{center}
+\resizebox{0.80\textwidth}{!}{%
+\begin{tikzpicture}[
+  font=\scriptsize,
+  >={Stealth[length=2mm]},
+  node2/.style={draw=black!45, rounded corners=3pt, fill=black!5,
+                inner sep=7pt, minimum width=40mm, minimum height=15mm},
+  proc/.style={draw=blue!55!black, thick, fill=blue!12, align=center,
+               inner sep=4pt, minimum height=7mm},
+  lbl/.style={font=\tiny, inner sep=1.5pt}
+]
+\node[proc] (oc) at (0,0) {opencode};
+\begin{scope}[on background layer]
+\node[node2, fit=(oc)] (n1) {};
+\end{scope}
+\node[lbl, text=black!60, above=1pt of n1] {compute302 --- where you are};
+
+\node[proc, fill=green!12, draw=green!45!black] (ol) at (9,0) {ollama on \texttt{127.0.0.1}};
+\begin{scope}[on background layer]
+\node[node2, fit=(ol)] (n2) {};
+\end{scope}
+\node[lbl, text=black!60, above=1pt of n2] {compute300 --- where the model is};
+
+\draw[->, very thick, red!70!black] (n1.east) -- (n2.west);
+\node[fill=white, text=red!70!black, font=\Large, inner sep=1pt] at (4.5,0) {$\times$};
+\node[lbl, text=red!70!black] at (4.5,0.6) {\textbf{refused}};
+\node[lbl, text=red!70!black] at (4.5,-0.6) {loopback is not routable};
+\end{tikzpicture}}
+\end{center}
+
+\vspace{0.1em}
+{\small \textbf{The fix uses machinery this repo already trusts.} \texttt{srun -{}-overlap} steps
+into a job on another node and hands you its stdin and stdout. \textbf{Slurm itself becomes the
+wire} --- no SSH, no open port, no socket anywhere.}
+
+\begin{center}
+\resizebox{0.92\textwidth}{!}{%
+\begin{tikzpicture}[
+  font=\scriptsize,
+  >={Stealth[length=2mm]},
+  node2/.style={draw=black!45, rounded corners=3pt, fill=black!5,
+                inner sep=7pt, minimum height=15mm},
+  proc/.style={draw=blue!55!black, thick, fill=blue!12, align=center,
+               inner sep=4pt, minimum height=7mm},
+  lbl/.style={font=\tiny, inner sep=1.5pt}
+]
+\node[proc] (oc) at (0,0) {opencode};
+\node[proc, fill=orange!15, draw=orange!70!black] (rt) at (3.0,0) {router};
+\draw[->, thick] (oc) -- node[lbl, below] {\texttt{127.0.0.1}} (rt);
+\begin{scope}[on background layer]
+\node[node2, fit=(oc)(rt)] (n1) {};
+\end{scope}
+\node[lbl, text=black!60, above=1pt of n1] {compute302 --- where you are};
+
+\node[proc, fill=orange!15, draw=orange!70!black] (rr) at (10.0,0) {relay};
+\node[proc, fill=green!12, draw=green!45!black] (ol) at (13.4,0) {ollama \texttt{127.0.0.1}};
+\draw[->, thick] (rr) -- (ol);
+\begin{scope}[on background layer]
+\node[node2, fit=(rr)(ol)] (n2) {};
+\end{scope}
+\node[lbl, text=black!60, above=1pt of n2] {compute300 --- where the model is};
+
+\draw[<->, very thick, orange!70!black] (n1.east) --
+  node[lbl, above] {\texttt{srun -{}-overlap} stdio}
+  node[lbl, below] {no port, no socket, no SSH} (n2.west);
+\end{tikzpicture}}
+\end{center}
+
+\vspace{-0.1em}
+{\scriptsize \textbf{The payoff:} the router lives on \emph{your} node, so when the fleet swaps the
+backend underneath you, the session does not notice. Ships in two stages; stage one just steps you
+onto the model's node, which works on day one.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{Citizenship: what ``gives it back'' actually means}
+
+\begin{center}
+\resizebox{0.95\textwidth}{!}{%
+\begin{tikzpicture}[
+  font=\scriptsize,
+  >={Stealth[length=2mm]},
+  stg/.style={draw=black!45, rounded corners=3pt, fill=black!7,
+               align=center, inner sep=4pt, text width=23mm, minimum height=15mm},
+  hot/.style={draw=orange!70!black, thick, fill=orange!15,
+              align=center, inner sep=4pt, text width=23mm, minimum height=15mm},
+  cool/.style={draw=blue!55!black, thick, fill=blue!12,
+               align=center, inner sep=4pt, text width=23mm, minimum height=15mm},
+  flow/.style={->, thick, draw=black!70}
+]
+\node[stg] (s1) at (0,0) {\textbf{1. see}\\a foreign job is pending on \texttt{Resources}};
+\node[hot]  (s2) at (3.2,0) {\textbf{2. drain}\\stop routing; let the current answer finish};
+\node[hot]  (s3) at (6.4,0) {\textbf{3. yield}\\cancel the job, give the node back};
+\node[cool] (s4) at (9.6,0) {\textbf{4. hold off}\\do \emph{not} re-request it};
+\node[cool] (s5) at (12.8,0) {\textbf{5. regrow}\\only once their job is running};
+\draw[flow] (s1) -- (s2);
+\draw[flow] (s2) -- (s3);
+\draw[flow] (s3) -- (s4);
+\draw[flow] (s4) -- (s5);
+\end{tikzpicture}}
+\end{center}
+
+\vspace{0.6em}
+\textbf{Step 4 is the one that is easy to skip and ruins everything.} Without it: the supervisor
+releases a node, notices one second later that it is below target, and re-submits --- winning the
+race against the very job it was trying to help. The fleet then looks maximally rude while running
+code written to be polite.
+
+\vspace{0.5em}
+\keybox{The rule is not a timer. It is: \textbf{do not ask for that resource again until the job
+that triggered the yield is no longer pending} --- with a 15-minute floor underneath it.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{Which thing gets given up first}
+
+Ordering principle: \emph{surrender the unit holding the most, that costs the least to bring back.}
+
+\begin{center}
+\small
+\begin{tabular}{clcc}
+\toprule
+\textbf{Rank} & \textbf{Unit} & \textbf{Holds} & \textbf{Costs to restore} \\
+\midrule
+1 & an idle vLLM replica & 1 GPU & a few minutes \\
+2 & an idle ollama server & 1 GPU & \meas\ 4m46s for 65\,GB \\
+3 & a compute306 booking & \textbf{4 GPUs} & minutes; biggest single win \\
+4 & a \emph{busy} vLLM replica & 1 GPU & minutes + the in-flight work \\
+5 & the colibr\`i backend & 1 GPU + $\sim$500\,GB RAM & \proj\ $\sim$31 minutes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.8em}
+Notice what the ordering does to colibr\`i without anybody writing a special case for it: it holds
+the \emph{least} GPU and takes \emph{longest} to come back, so it lands at the bottom naturally.
+
+\vspace{0.5em}
+{\scriptsize \textbf{Why restore cost dominates.} There is no local scratch disk on these nodes,
+so every cold model load is an NFS read at \meas\ $\sim$230\,MB/s. A fleet that thrashes is worse
+than a fleet that is simply smaller. Hysteresis is not tuning --- it is correctness.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{Restarting itself, and the switch that stops it}
+
+\begin{center}
+\resizebox{0.80\textwidth}{!}{%
+\begin{tikzpicture}[
+  font=\scriptsize,
+  >={Stealth[length=2mm]},
+  gen/.style={draw=blue!55!black, thick, fill=blue!12,
+              align=center, inner sep=4pt, text width=24mm, minimum height=12mm},
+  pend/.style={draw=black!45, dashed, rounded corners=3pt, fill=black!5,
+               align=center, inner sep=4pt, text width=24mm, minimum height=12mm},
+  kill/.style={draw=red!70!black, thick, fill=red!10,
+               align=center, inner sep=4pt, text width=26mm, minimum height=11mm},
+  flow/.style={->, thick, draw=black!70},
+  lbl/.style={font=\tiny, inner sep=1.5pt}
+]
+\node[gen]  (g1) at (0,0)    {\textbf{generation 1}\\running, 8h45m};
+\node[pend] (g2) at (4.0,0)  {\textbf{generation 2}\\queued, waiting};
+\node[pend] (g3) at (8.0,0)  {\textbf{generation 3}\\queued, waiting};
+\node[kill] (k)  at (4.0,-2.3) {\textbf{\texttt{fleet down}}\\writes \texttt{STOP}, then cancels};
+
+\draw[flow] (g1) -- node[lbl, above] {submits at birth}
+                   node[lbl, below] {\texttt{-{}-dependency=afterany}} (g2);
+\draw[flow] (g2) -- (g3);
+\draw[flow, draw=red!70!black] (k) -- node[lbl, right] {checked first, always} (g2);
+\node[lbl, text=black!55, align=center] at (0,-1.5) {dies for \emph{any} reason:\\walltime, crash,
+node failure, \texttt{scancel}};
+\draw[->, black!45, dashed] (0,-1.1) -- (0,-0.65);
+\end{tikzpicture}}
+\end{center}
+
+\vspace{0.2em}
+{\small \textbf{Each generation submits its successor the moment it starts}, with a dependency that
+fires on \emph{any} termination --- walltime, a crash, a node vanishing. A pending job costs
+nothing, so the queued successor is free insurance.}
+
+\vspace{0.3em}
+\keybox{\small \textbf{The kill switch is a file, not a signal.} \texttt{fleet down} writes
+\texttt{STOP} \emph{before} it cancels anything, so the successor starts, reads it, and exits in
+two seconds. It works when the supervisor is wedged and when its node is gone --- a kill switch
+that depends on the thing it kills is not one.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{How fast, honestly}
+
+\begin{center}
+\small
+\begin{tabular}{llrrl}
+\toprule
+\textbf{Tier} & \textbf{Model} & \textbf{VRAM} & \textbf{Speed} & \textbf{Where it fits} \\
+\midrule
+fast & \texttt{qwen3-coder:30b} & 18.6\,GB & \proj\ 40--60 tok/s & any one A40 --- \textbf{6 nodes} \\
+big  & \texttt{gpt-oss:120b}    & 70\,GB    & \meas\ 34.1 tok/s   & 4$\times$A40 --- \textbf{compute306 only} \\
+huge & GLM-5.2 744B int4        & (RAM)     & \proj\ high single digits & 1 A40 + $\sim$500\,GB RAM \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.5em}
+\begin{columns}[T]
+\begin{column}{0.48\textwidth}
+{\small\textbf{Warm is the number that matters.}\\
+34.1 tok/s reads comfortably. 40--60 \emph{works} comfortably --- an agent making tool calls needs
+speed more than brilliance.}
+\end{column}
+\begin{column}{0.48\textwidth}
+{\small\textbf{Cold is the number that hurts.}\\
+\meas\ \textbf{4m46s} to page \texttt{gpt-oss:120b} off the share before its first token. Every
+yield decision is arithmetic about that number.}
+\end{column}
+\end{columns}
+
+\vspace{0.5em}
+\keybox{\small \textbf{The structural rule that falls out:} the \emph{fast} model drives the agent loop.
+The big models are \textbf{consultants} --- asked one hard question, given a few hundred tokens to
+answer it. Thirty seconds of consultation inside a five-minute task is invisible. Driving the whole
+loop at 8 tok/s is unusable.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{What this is not}
+
+\keybox{\large It is not Claude, and no amount of plumbing makes it Claude.}
+
+\vspace{0.7em}
+The gap is the \textbf{weights}, not the serving. Three specific things stay true after everything
+above is built:
+
+\begin{itemize}\small
+\item \textbf{The ceiling is \texttt{gpt-oss:120b}}, a good open 120B coder --- and it needs the
+      cluster's only four-GPU node, which is exactly the resource the design says never to camp on.
+\item \textbf{The 744B model is not automatically better.} Its int4 container measures
+      \textbf{$-$8.2 percentage points} of quantization damage, concentrated on the hardest
+      questions. A 744B model at int4 beating a well-served 120B at 8-bit is a \emph{hypothesis},
+      and nobody has run the comparison on our tasks.
+\item \textbf{No routing layer fixes this.} No arrangement of three engines is smarter than the
+      best model among them. The fleet buys coverage, uptime and politeness --- not intelligence.
+\end{itemize}
+
+\vspace{0.6em}
+\textbf{So why build it?} One reason, and it is enough:
+
+\keybox{A frontier-scale model that \textbf{may read PHI}. No hosted service will ever be allowed
+to do that here. That is the capability, and it is not available any other way.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{What it costs us}
+
+The hardware is bought and powered. The real bill is in two other currencies.
+
+\begin{center}
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Currency} & \textbf{Amount} & \textbf{Who pays} \\
+\midrule
+other people's queue time & bounded by caps + yielding & colleagues \\
+our own fair-share & $\sim$500{,}000 usage units at steady state & \textbf{our own research jobs} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.5em}
+{\small \textbf{The second one is the surprise.} A supervisor running around the clock holds
+Slurm's minimum billable unit --- two CPUs, always, because cores here carry two threads and
+nothing smaller can be allocated. At the cluster's two-day decay that reaches a steady-state usage
+contribution \textbf{roughly the size of everything this account currently runs}. Fair-share is
+the heaviest term in the priority formula, so a fleet that never sleeps makes the PSYCH-ASR and
+TRD-EHR jobs it exists to serve schedule \emph{worse}.}
+
+\vspace{0.4em}
+\keybox{\small \textbf{The fix is boring and it works:} when the fleet has held no GPUs for two hours, the
+supervisor exits too. Typing \texttt{fleet code} brings it back in about thirty seconds. A
+supervisor watching an empty fleet is indistinguishable, from your seat, from no supervisor at
+all.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{Three cluster facts nobody had checked}
+
+Found while planning this, on the live scheduler. Each one changes something.
+
+\begin{enumerate}\small
+\item \textbf{The \texttt{c3} partition can silently freeze our server.} \texttt{c3\_short}
+      outranks \texttt{c3} on the same six nodes, and the configured response is
+      \emph{suspend} --- \texttt{SIGSTOP}, not requeue. A suspended server keeps its VRAM (so the
+      preemption helps nobody) and stops mid-generation with the socket open, so the client gets
+      no error, just silence.
+      \textbf{Consequence:} the fleet never uses \texttt{c3}. The README currently recommends it
+      for long-lived servers; that advice is a trap.
+
+\item \textbf{Asking for memory silently buys CPUs.} Memory is capped at 12\,GB per CPU here, so
+      \texttt{-{}-mem=64G -{}-cpus-per-task=4} does not get 4 CPUs --- it gets 6. Our careful
+      CPU-rightsizing argument was being undone by the memory line the whole time.
+
+\item \textbf{Almost nothing on this cluster is actually blocked.} Of the 27 pending jobs visible
+      the day this was written, \textbf{all 27} were waiting on a start time they had asked for,
+      not on resources. A naive ``somebody is waiting, give a node back'' rule would surrender the
+      entire fleet, continuously, to jobs it was not blocking.
+      \textbf{Consequence:} the yield filter is the load-bearing part, and the yield path has to be
+      tested on purpose because it will rarely fire on its own.
+\end{enumerate}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{Build order --- each step is useful before the next exists}
+
+\begin{center}
+\small
+\begin{tabular}{llll}
+\toprule
+\textbf{Phase} & \textbf{What lands} & \textbf{What you get} & \textbf{Needs a GPU?} \\
+\midrule
+P0 & 8 verification tests & the facts on slide 12, confirmed & no \\
+P1 & supervisor, chain, kill switch & something that never dies & no \\
+P2 & backends, caps, idle release & it starts and stops servers for you & yes \\
+P3 & the yield ladder & it is a good citizen & yes \\
+P4a & \texttt{fleet code} & \textbf{you stop typing \texttt{ollama-up}} & yes \\
+P4b & the relay & sessions survive a backend swap & yes \\
+P5 & vLLM, colibr\`i & throughput, and the 744B consultant & yes \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.8em}
+\keybox{\textbf{P4a is the moment it becomes worth having.} Everything before it is machinery;
+that is the phase where the daily command changes. P5 is a different project wearing the same
+name --- do not start it until the fleet has run unattended for a week.}
+
+\vspace{0.5em}
+{\scriptsize P0 is a day. It goes first because any one of its eight tests can invalidate a design
+decision above it, and finding that out after P3 is expensive. One of the eight submits jobs to a
+shared queue and gets asked about first.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{Five decisions that are yours, not mine}
+
+\begin{center}
+\scriptsize
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{p{0.44\textwidth}p{0.28\textwidth}p{0.19\textwidth}}
+\toprule
+\textbf{Question} & \textbf{Proposed} & \textbf{Cost if changed} \\
+\midrule
+Does any backend ever bind a network interface, instead of loopback? & \textbf{No.} Use the relay. &
+Yes weakens the strongest PHI control we have \\
+How many of the six single-GPU nodes may the fleet hold? & \textbf{2} &
+more is ruder, fewer is slower \\
+May it book compute306 on its own? & \textbf{No} --- only \texttt{fleet up -{}-big} &
+it is the only 4-GPU node on the cluster \\
+Permanent supervisor, or exit when idle? & \textbf{Exit after 2 idle hours} &
+permanent roughly doubles our recent usage \\
+Which model is the default fast tier? & \texttt{qwen3-coder:30b} &
+a bigger 8-bit model also fits 46\,GB; nobody has measured the trade \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.6em}
+{\scriptsize These are recorded as open in \texttt{FLEET-BUILD.md} §11. Answer them once, with a
+date, and the implementation stops guessing.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{What ``done'' looks like}
+
+\keybox{\parbox{0.9\textwidth}{\vspace{0.3em}
+You type \texttt{fleet code} on any node and get a TUI against a local model in under a minute.
+
+You close the laptop. Overnight the fleet releases everything it holds and the supervisor exits.
+
+In the morning \texttt{fleet code} brings it back.
+
+If a colleague's GPU job goes pending at 2 p.m., the fleet finishes your answer, gives the node
+back, and does not take it again until their job is running --- and the log says so, with their
+job id, when anybody asks.
+\vspace{0.3em}}}
+
+\vspace{1em}
+Nothing in that paragraph requires an administrator, a daemon on a login node, or a person
+watching.
+
+\vspace{0.8em}
+\begin{center}
+\textbf{That is the deliverable.} \quad It is achievable. \quad It is not Claude.
+\end{center}
+
+\end{frame}
+
+\end{document}

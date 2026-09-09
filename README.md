@@ -29,6 +29,13 @@ appears, it uses this too.
 > must not be read as one document. Durable facts graduate from `DESIGN.md` into here when a piece
 > is built and verified. (Added 2026-08-22.)
 
+> **Where the next phase is scheduled.** [`FLEET-BUILD.md`](FLEET-BUILD.md) is the build runbook for
+> that design: the feasibility verdict, the phases with their exit criteria, the eight preflight
+> tests, and the four live-cluster findings that changed three of `DESIGN.md`'s assumptions. Still
+> nothing built — this is the work order, not a record of work. A 16-slide plain-language
+> walkthrough of the same system is [`docs/fleet_walkthrough.pdf`](docs/fleet_walkthrough.pdf)
+> (source `docs/fleet_walkthrough.tex`, built with `pdflatex`). (Added 2026-09-09.)
+
 > **How the assistant is fenced in.** [`PERMISSIONS.md`](PERMISSIONS.md) is the architecture record
 > for Claude Code's permission configuration on this account: which commands skip the prompt, which
 > paths are refused outright, and the `PreToolUse` hook that makes `PSYCH-ASR` diarization and ASR
@@ -320,6 +327,15 @@ Two Slurm jobs. Submit **from the repo root** — the log paths are relative.
 (compute300–305, one A40 each). They differ only in time limit — 7 days versus 9 hours — and in how
 contended they are: `c3` was carrying 201 running jobs against `c3_short`'s 13 when this was
 measured. A server that lives under 9 hours schedules sooner on `c3_short`, so that is the default.
+
+> **Do not act on the "switch to `c3`" sentence below without reading
+> [`FLEET-BUILD.md`](FLEET-BUILD.md) §2.1 first.** (Added 2026-09-09.) `c3_short` sits at
+> `PriorityTier=20` and `c3` at `10`, with `PreemptType=preempt/partition_prio` and `c3`'s
+> `PreemptMode=SUSPEND`. On that reading a `c3_short` job can `SIGSTOP` a server running in `c3` on
+> the same node — which does not free its VRAM, so it helps nobody, and leaves the client waiting on
+> a frozen generation with no error. **Inferred from the partition configuration on 2026-09-09, not
+> yet observed**; it is the first of that file's preflight tests. Until it is settled, prefer
+> `c3_short` and a shorter walltime.
 Switch the file to `c3` if you want one to outlive that; `ollama-up` rejects a `single` walltime over
 9 h rather than letting Slurm return a partition-limit error that does not say what to change.
 
@@ -695,8 +711,11 @@ Do not re-learn these.
   hold**, and regrows when it can. The full design — goals and non-goals, the placement argument, the
   two data planes, the yield ladder, the citizenship rules, milestones with exit criteria, the
   measurements we owe ourselves, and the traps anticipated but not yet paid for — is
-  [`DESIGN.md`](DESIGN.md). Read that before writing any of it. Three things from it that change how
-  the items below should be read:
+  [`DESIGN.md`](DESIGN.md). Read that before writing any of it — and then
+  [`FLEET-BUILD.md`](FLEET-BUILD.md), added 2026-09-09, which turns it into an ordered build with
+  exit criteria, records the four live-cluster findings that revised it, and lists the five
+  decisions that are the user's to make before any of it starts. Three things from `DESIGN.md` that
+  change how the items below should be read:
   - **Replicas, not shards.** With NVLink inactive (§1), independent single-GPU replicas beat
     tensor parallelism for any model that fits on one card — more aggregate throughput, and a replica
     can be surrendered one at a time where a 4-GPU job cannot. This supersedes the tensor-parallel
