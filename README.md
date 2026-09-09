@@ -30,19 +30,28 @@ appears, it uses this too.
 > is built and verified. (Added 2026-08-22.)
 
 > **Where the next phase is scheduled.** [`FLEET-BUILD.md`](FLEET-BUILD.md) is the build runbook.
-> **Revised 2026-09-09 (third pass): three tiers on different hardware.** Tier 1 is the daily
-> driver — vLLM on compute306's four A40s serving a ~200–250B MoE at int4 with continuous batching,
-> many users at a projected 20–40 tok/s each. Tier 2 is the consultant — colibrì running GLM-5.2
-> (744B, int4, 372 GB) on one `c3` node at a projected 8–12 tok/s, reached by an explicit tool call.
-> Tier 3 is batch corpus work on the filesystem queue, with no socket at all.
+> **Revised 2026-09-09 (fourth pass): an elastic pool over 7 nodes and 10 A40s.** The everyday
+> helper needs **one GPU of ten**, so it is effectively never absent; a larger version appears on
+> compute306 when that node has cards to spare; colibrì's GLM-5.2 (744B, int4, 372 GB) sits behind
+> an explicit tool call as the consultant; batch corpus work soaks up whatever is left on the
+> filesystem queue, with no socket at all. The pool is filled in priority order and emptied in
+> reverse, **eight of the ten GPUs release within seconds**, and the last free GPU in the partition
+> is never taken.
 >
-> The reason for three tiers rather than one is arithmetic, not taste: GLM-5.2 routes top-8 of 256
-> experts, so the expert **union** grows almost linearly with batch size and **neither continuous
-> batching nor speculative decoding amortises the dominant cost**. Multi-user speed has to come from
-> a different model, not a different setting. The runbook carries that derivation, two corrections
-> to the previous pass, the eleven-test measurement campaign, and the five decisions that are the
-> user's. Still nothing built. A 16-slide walkthrough is
-> [`docs/fleet_walkthrough.pdf`](docs/fleet_walkthrough.pdf) (source `docs/fleet_walkthrough.tex`).
+> The reason for more than one model is arithmetic, not taste: GLM-5.2 routes top-8 of 256 experts,
+> so the expert **union** grows almost linearly with batch size and **neither continuous batching
+> nor speculative decoding amortises the dominant cost** — confirmed by a controlled full-residency
+> run, not projected. Multi-user speed has to come from a different model, not a different setting.
+>
+> **Acceptance is assistant-run** (§11.3): a durable suite in `eval/` covering plumbing, speed,
+> capability graded against ground truth already sitting in these repositories, and a pushback test
+> for whether the model holds a correct answer when told it is wrong. Objective, keyed and
+> subjective grading are reported separately — an assistant grading its own replacement is a
+> conflict of interest that task design has to solve, not good intentions.
+>
+> Still nothing built. A 17-slide plain-language walkthrough is
+> [`docs/fleet_walkthrough.pdf`](docs/fleet_walkthrough.pdf) (source `docs/fleet_walkthrough.tex`,
+> built with `pdflatex`).
 
 > **How the assistant is fenced in.** [`PERMISSIONS.md`](PERMISSIONS.md) is the architecture record
 > for Claude Code's permission configuration on this account: which commands skip the prompt, which
