@@ -20,8 +20,8 @@
 \newcommand{\meas}{{\color{blue!55!black}\textbf{measured}}}
 \newcommand{\proj}{{\color{orange!75!black}\textbf{projected}}}
 
-\title{A Frontier Model That Behaves Itself}
-\subtitle{colibr\`i on LIBR compute --- what it is, how you use it, and how fast it really goes}
+\title{Getting Close}
+\subtitle{A tiered local inference service --- how fast it can really go, and why}
 \author{\texttt{libr-local-llm} --- the next phase}
 \date{}
 
@@ -30,37 +30,32 @@
 \frame{\titlepage}
 
 %----------------------------------------------------------
-\begin{frame}{The whole thing in one sentence}
+\begin{frame}{The answer, before the argument}
 
-\keybox{\large A \textbf{744-billion-parameter} model, running on one LIBR node, that reads PHI,
-answers one hard question at a time, and hands the node back when somebody else needs it.}
+\begin{center}
+\small
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+& \textbf{hosted} & \textbf{tier 1 --- daily driver} & \textbf{tier 2 --- consultant} \\
+\midrule
+speed & 50--100 tok/s & \textbf{20--40 tok/s} \proj & 8--12 tok/s \proj \\
+concurrent users & many & \textbf{many} & \textbf{one} \\
+model & frontier & $\sim$200--250B MoE, int4 & \textbf{744B}, int4 \\
+may read PHI & \textbf{never} & \textbf{yes} & \textbf{yes} \\
+\bottomrule
+\end{tabular}
+\end{center}
 
 \vspace{0.7em}
-\begin{columns}[T]
-\begin{column}{0.47\textwidth}
-{\small\textbf{What you gain}
-\begin{itemize}\small
-\item Frontier-scale weights, entirely on-premises
-\item Reasoning quality no 30B model reaches
-\item Tool calling, so a real terminal client works
-\item An API key --- the first engine here that has one
-\end{itemize}}
-\end{column}
-\begin{column}{0.47\textwidth}
-{\small\textbf{What it costs}
-\begin{itemize}\small
-\item \textbf{6--12 tokens per second}
-\item \textbf{27 minutes} to start from cold
-\item One generation at a time, ever
-\item About one whole node of the six
-\end{itemize}}
-\end{column}
-\end{columns}
+\keybox{\textbf{Tier 1 is the answer to the actual question.} Several people, each in their own
+VSCode terminal, at within a small factor of the hosted experience. \textbf{Tier 2 is where the
+744B lives} --- reached by an explicit tool call when a question deserves it, not the thing you type
+at.}
 
 \vspace{0.6em}
-\keybox{\textbf{Read those two columns together.} This is a \textbf{consultant}, not an agent loop.
-One hard question and 80 seconds is a good trade. Forty tool calls is not, and no engineering in
-this deck changes that.}
+{\small What you cannot have is the 744B itself at conversational speed for everyone. That is not a
+tuning failure. It is a property of how the model routes, and slide 5 is the arithmetic.}
 
 \end{frame}
 
@@ -73,13 +68,12 @@ A 744B mixture-of-experts activates only about \textbf{40B parameters per token}
 \begin{center}
 \resizebox{0.95\textwidth}{!}{%
 \begin{tikzpicture}[
-  font=\scriptsize,
-  >={Stealth[length=2mm]},
+  font=\scriptsize, >={Stealth[length=2mm]},
   tier/.style={rounded corners=3pt, align=center, inner sep=5pt, minimum height=13mm},
   lbl/.style={font=\tiny, inner sep=1.5pt}
 ]
 \node[tier, draw=green!45!black, thick, fill=green!14, minimum width=32mm] (v) at (0,0)
-  {\textbf{VRAM} --- one A40, 46\,GB\\[2pt]dense + attention + KV\\$\approx$23\,GB};
+  {\textbf{VRAM} --- A40, 46\,GB\\[2pt]dense + attention + KV\\$\approx$23\,GB};
 \node[tier, draw=blue!55!black, thick, fill=blue!12, minimum width=42mm] (r) at (6.6,0)
   {\textbf{RAM} --- 1\,TB on every node\\[2pt]\textbf{all 19,456 routed experts}\\372\,GB, fully resident};
 \node[tier, draw=black!45, fill=black!6, minimum width=32mm] (d) at (13.4,0)
@@ -94,288 +88,282 @@ A 744B mixture-of-experts activates only about \textbf{40B parameters per token}
 watches what actually runs. colibr\`i makes the same bet: parameters are not state to be held, they
 are \textbf{data to be staged}, exactly when the router proves they are needed.
 
-\vspace{0.5em}
-\keybox{\textbf{Placement decides speed and nothing else.} The router's decisions and the weights'
-precision are identical whether an expert answered from VRAM or from disk. You cannot make it
-\emph{wrong} by placing it badly --- only slow.}
+\vspace{0.4em}
+{\scriptsize \textbf{Placement decides speed and nothing else.} The router's decisions and the
+weights' precision are identical whether an expert answered from VRAM or from disk.}
 
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{Where the speed comes from, and where it stops}
+\begin{frame}{Where the time actually goes: two halves, roughly equal}
 
-Every token has to read the experts it routes to. That single fact is the whole ceiling.
+Measured by colibr\`i's own profiler on a \textbf{2-socket Ice Lake, 48 cores, model fully
+resident} --- our CPU class:
 
-\keybox{\parbox{0.85\textwidth}{\centering\vspace{0.2em}
-\texttt{8 experts $\times$ 20.1\,MB $\times$ 75 layers = \textbf{12.1\,GB touched per token}}
-
-\vspace{0.4em}
-\texttt{tokens/second = memory bandwidth $\div$ 12.1\,GB}
-\vspace{0.2em}}}
+\keybox{\parbox{0.72\textwidth}{\ttfamily\small
+4.68 tok/s\hfill = 214 ms per token \\[0.3em]
+\hspace*{1em}expert read: 12.1 GB / 131.9 GB/s\hfill = \ \ 92 ms\quad(43\%) \\
+\hspace*{1em}attention, dense, router, orchestration\hfill = 122 ms\quad(57\%)}}
 
 \vspace{0.7em}
-On the reference machine colibr\`i was tuned on, the expert path sustained \meas\ \textbf{19.7 GB/s}
---- only 23\% of that host's memory --- and the ceiling was \textbf{3.0 tok/s}. Everything else in
-the engine is bounded above by that line.
+An independent profile on different hardware agrees: expert-matmul 46\%, attention 26\%.
 
 \vspace{0.6em}
-\begin{center}
-\small
-\begin{tabular}{@{}lrr@{}}
-\toprule
-& \textbf{bandwidth} & \textbf{ceiling} \\
-\midrule
-reference host, as measured & 19.7 GB/s & 3.0 tok/s \\
-reference host, memory saturated & 85 GB/s & 13.0 tok/s \\
-\textbf{our node} (2$\times$ Ice Lake, 8 channels/socket) & \textbf{$\sim$410 GB/s theoretical} & --- \\
-\bottomrule
-\end{tabular}
-\end{center}
+\keybox{\textbf{This is the fact that reshaped the design.} There is no single bottleneck. Optimise
+either half perfectly and Amdahl caps you \textbf{under 2$\times$}. Every plan that attacked one
+half --- more GPUs, more RAM, faster disk --- was aiming at at most half the problem.}
 
 \vspace{0.5em}
-{\scriptsize The gap between the first two rows is why this is a \emph{tuning} problem rather than a
-hardware problem, and the third row is why our node is worth tuning.}
+{\scriptsize The obvious next move is to produce several tokens per pass, so the 57\% is paid once
+for many tokens. That is what batching and speculation do, and it is the next slide.}
 
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{Our node is the good case, for two reasons}
+\begin{frame}{Why batching and speculation both fail --- the deep result}
+
+GLM-5.2 routes \textbf{top 8 of 256} experts per layer. Processing $B$ tokens in one pass must read
+the \textbf{union} of their experts:
 
 \begin{center}
-\scriptsize
-\renewcommand{\arraystretch}{1.15}
-\begin{tabular}{@{}p{0.16\textwidth}p{0.37\textwidth}p{0.40\textwidth}@{}}
+\small
+$\mathbb{E}[\text{distinct experts}] = 256 \times \left(1 - (1 - 8/256)^{B}\right)$
+
+\vspace{0.5em}
+\begin{tabular}{@{}rrrl@{}}
 \toprule
-& \textbf{reference host (4$\times$A6000)} & \textbf{LIBR compute30\emph{x}} \\
+\textbf{batch} & \textbf{experts} & \textbf{bytes} & \\
 \midrule
-CPU & EPYC Zen 2, 24c/48t, \textbf{AVX2 only} & 2$\times$ Xeon Ice Lake, \textbf{48c/96t, AVX-512 + VNNI} \\
-RAM & 264\,GB DDR4-2400, $\sim$85\,GB/s & \textbf{1\,TB} DDR4-3200, $\sim$410\,GB/s \\
-residency & 367 of 429\,GB --- \textbf{disk stays in the path} & \textbf{372 of 1024\,GB --- disk leaves entirely} \\
-GPU & 4$\times$ A6000 48\,GB, sm\_86 & 1--4$\times$ A40 46\,GB, \textbf{same generation} \\
-storage & local NVMe, 2.9\,GB/s & NFS, 0.23\,GB/s --- 12$\times$ worse, \textbf{cold start only} \\
+1 & 8.0 & 1.0$\times$ & one token \\
+5 & 37.6 & \textbf{4.7$\times$} & $\leq$5 tokens --- speculation depth 4 \\
+8 & 57.4 & \textbf{7.2$\times$} & 8 tokens --- eight users \\
+16 & 99.5 & \textbf{12.4$\times$} & 16 tokens \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.3em}
+{\small\textbf{The union grows almost linearly with the batch.} The 43\% expert half does not amortise ---
+only the 57\% half does. At 8 slots: \textbf{10 tok/s aggregate, but 1.25 tok/s each.} Speculation
+at depth 4 returns about \textbf{1.35$\times$}, which is why colibr\`i's own notes record MTP
+\emph{losing} 32\% in some regimes.}
+
+\vspace{0.3em}
+\keybox{\textbf{You cannot batch your way to a fast frontier model here.} Multi-user speed has to
+come from a \textbf{different model}, not a different setting. Hence three tiers.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{Two things the last version of this deck got wrong}
+
+\begin{columns}[T]
+\begin{column}{0.48\textwidth}
+{\small\textbf{1. ``colibr\`i is single-user.''}\\[0.3em]
+It is not. \texttt{SERVE\_BATCH=1} selects a
+\textbf{continuous-batching} scheduler with up to 16 KV slots --- \emph{``every active slot
+contributes one row per forward.''}
+
+\vspace{0.4em}
+The 1.32 / 1.51 / 1.46 tok/s figure I quoted was measured on a host where \textbf{the experts were
+not resident}, so extra slots thrashed the cache. It does not transfer.
+
+\vspace{0.4em}
+It still does not rescue us --- but for the union reason on the previous slide, not this one.}
+\end{column}
+\begin{column}{0.48\textwidth}
+{\small\textbf{2. ``Four GPUs are worth under 2\%.''}\\[0.3em]
+That A/B ran on a host pulling \textbf{19.7 GB/s of an available 85} --- 23\% of the machine.
+Placement could not matter, because the CPU could not consume faster from either tier.
+
+\vspace{0.4em}
+On a host that pulls \textbf{131.9 GB/s} the question reopens: A40 memory is $\sim$696 GB/s, so
+experts in VRAM arrive \textbf{$\sim$5$\times$ faster} than from RAM.
+
+\vspace{0.4em}
+\textbf{Corrected: open, and a measurement we owe.} Possibly worth 1.6$\times$ on the expert half.}
+\end{column}
+\end{columns}
+
+\vspace{0.6em}
+\keybox{Both errors came from carrying somebody else's measurement onto different hardware without
+checking what limited it. That is the trap colibr\`i's own experiment log spends a whole section
+warning about.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{The architecture: three tiers on different hardware}
+
+\begin{center}
+\resizebox{0.78\textwidth}{!}{%
+\begin{tikzpicture}[
+  font=\scriptsize, >={Stealth[length=2mm]},
+  usr/.style={draw=black!45, rounded corners=3pt, fill=black!7, align=center,
+              inner sep=4pt, minimum height=11mm, minimum width=30mm},
+  t1/.style={draw=blue!55!black, very thick, fill=blue!12, align=center,
+             inner sep=4pt, minimum height=17mm, minimum width=58mm},
+  t2/.style={draw=green!45!black, very thick, fill=green!12, align=center,
+             inner sep=4pt, minimum height=17mm, minimum width=58mm},
+  t3/.style={draw=black!50, thick, fill=black!5, align=center,
+             inner sep=4pt, minimum height=11mm, minimum width=58mm},
+  flow/.style={->, very thick, draw=black!75},
+  lbl/.style={font=\tiny, inner sep=1.5pt}
+]
+\node[usr] (u) at (0,0.4) {\textbf{several people}\\ssh + VSCode terminal\\any node};
+\node[t1] (a) at (7.6,1.9) {\textbf{TIER 1 --- the daily driver}\\vLLM on compute306, 4$\times$A40 TP=4\\$\sim$200--250B MoE at int4 ($\sim$120\,GB)\\\textbf{continuous batching, MANY USERS}\\\textbf{20--40 tok/s each}};
+\node[t2] (b) at (7.6,-1.4) {\textbf{TIER 2 --- the consultant}\\colibr\`i on one \texttt{c3} node\\GLM-5.2 744B int4, 372\,GB\\\texttt{KV\_SLOTS=1} + speculation\\\textbf{8--12 tok/s, one at a time}};
+\node[t3] (c) at (0,-2.9) {\textbf{TIER 3 --- batch corpus work}\\vLLM replicas, filesystem queue\\\textbf{no socket at all} --- PSYCH-ASR};
+\draw[flow] (u.east) -- node[lbl, above, sloped] {the agent loop lives here} (a.west);
+\draw[flow, draw=green!45!black] (a.south) -- node[lbl, right, align=left] {one explicit\\``ask the big\\model'' tool call} (b.north);
+\node[lbl, text=black!55, align=center, below=2pt of c] {shares no caller with tier 1 --- \textbf{so no router is needed}};
+\end{tikzpicture}}
+\end{center}
+
+\vspace{-0.1em}
+{\scriptsize \textbf{An agent loop makes dozens of cheap calls and a few expensive ones.} Routing
+all of them through a 10 tok/s model wastes both the model and the person. Escalation is
+\textbf{explicit} --- automatic quality-based cascade is research-grade and unreliable.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{Tier 1 --- and why it is not the model you already rejected}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lll@{}}
+\toprule
+& \textbf{what you tried} & \textbf{tier 1} \\
+\midrule
+model & \texttt{qwen3-coder:30b} & a $\sim$200--250B MoE, $\sim$20B active \\
+quantization & q4 GGUF & int4 AWQ or GPTQ/Marlin \\
+server & ollama, defaults & vLLM, continuous batching, full context \\
+parameters & 30B & \textbf{roughly eight times as many} \\
+hardware & one A40 & \textbf{four A40s, 184\,GB} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \vspace{0.7em}
-Two rows matter and the rest is detail.
+\keybox{\textbf{compute306 finally has a defensible use.} 184\,GB of VRAM is the only place on this
+cluster a $\sim$120\,GB model fits, and a service for \emph{everybody} is worth the only four-GPU
+node in a way a single-user one never was. This reverses the previous recommendation --- because
+the node is now serving the whole lab.}
 
+\vspace{0.5em}
+{\scriptsize \textbf{Two open items, both real.} The exact checkpoint is task one of the build, not
+a guess in a slide --- it must fit 184\,GB minus KV, be int4 (\textbf{Ampere has no FP8}), and
+support tool calling. And tensor parallelism across four cards pays a PCIe all-reduce every layer,
+because \textbf{NVLink reports all links inactive}: two TP=2 replicas may beat one TP=4. Measure it.}
+
+\end{frame}
+
+%----------------------------------------------------------
+\begin{frame}{Tier 2 --- squeezing the 744B, honestly}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+\textbf{Configuration} & \textbf{expert} & \textbf{other} & \textbf{total} & \textbf{tok/s} \\
+\midrule
+\meas\ CPU only, fully resident, \texttt{XEXP=1} & 92 ms & 122 ms & 214 ms & \textbf{4.68} \\
+$+$ \texttt{CUDA\_DENSE=1} on one A40 & 92 & $\sim$61 & 153 ms & $\sim$6.5 \\
+$+$ four A40s (VRAM expert tier) & $\sim$55 & $\sim$61 & 116 ms & $\sim$8.6 \\
+$+$ MTP speculation at \texttt{KV\_SLOTS=1} & --- & --- & --- & \textbf{$\sim$10--12} \\
+\midrule
+\emph{or} cluster mode across 6 nodes & $\sim$34 & $\sim$61 & 95 ms & $\sim$10.5 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{0.6em}
+\textbf{Only the first row is measured.} Everything below it is a modelled multiplier built from
+measured parts, and the campaign replaces them.
+
+\vspace{0.5em}
 \begin{itemize}\small
-\item \textbf{AVX-512 VNNI} gives the int4 kernels a path the reference host did not have. colibr\`i
-      picks it automatically --- \emph{if you compile for this machine}. The default build target is
-      AVX2 and would throw it away.
-\item \textbf{1\,TB of RAM} holds the entire model. That removes disk from decode permanently, which
-      is the configuration behind every good number colibr\`i has ever published, and which the
-      reference host could not reach.
+\item \texttt{CUDA\_DENSE=1} attacks the 57\% half. \meas\ $\times$2.8 elsewhere, and
+      \textbf{undocumented in colibr\`i's public README}.
+\item Speculation and multi-slot are \textbf{mutually exclusive} in the engine. Tier 2 is not
+      batching anyway --- so take the speculation.
 \end{itemize}
 
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{The counter-intuitive result: one GPU, not four}
+\begin{frame}{Cluster mode --- real, and not yet ready}
 
-Having 1\,TB of RAM changes what the GPU is \emph{for}.
-
-\begin{center}
-\small
-\begin{tabular}{@{}p{0.44\textwidth}p{0.50\textwidth}@{}}
-\toprule
-\textbf{What the GPU is for} & \textbf{What more GPUs would add} \\
-\midrule
-The \textbf{dense and attention} tensors.
-$\approx$12\,GB, plus $\approx$11\,GB of KV cache.
-\textbf{23\,GB --- one A40 holds it.} &
-More \emph{experts} resident in VRAM instead of RAM.
-Which, once the model is RAM-resident, is worth\ldots \\
-\midrule
-\meas\ \textbf{$\times$2.8} (1.53 $\rightarrow$ 4.26 tok/s) &
-\meas\ \textbf{under 2\%} \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\vspace{0.4em}
-{\small colibr\`i's own controlled A/B: VRAM-heavy (188\,GB) and balanced (176\,GB) measured
-\textbf{2.81 vs 2.78 tok/s} --- indistinguishable. Raising the \emph{RAM} budget by 30\,GB bought
-\textbf{+25\%}.}
-
-\vspace{0.4em}
-\keybox{\textbf{So the service never needs compute306.} It takes one A40 of the seven on the cluster
-and leaves the only four-GPU node completely alone. That is the strongest citizenship position
-available to us, and it falls out of the arithmetic rather than out of good manners.}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{The number, and where it comes from}
-
-colibr\`i's source carries measurements taken on a \textbf{2-socket Ice Lake, 48 cores, model fully
-resident} --- the same CPU generation, core count, and residency condition as ours.
+{\small colibr\`i can shard experts \emph{across machines}. The coordinator keeps generation,
+routing and KV local; expert workers on other nodes run the routed FFNs. \textbf{Only activations
+cross the wire} --- about 24\,MB per token.}
 
 \begin{center}
-\scriptsize
-\begin{tabular}{@{}lrrl@{}}
-\toprule
-\textbf{Condition} & \textbf{tok/s} & \textbf{expert-matmul} & \textbf{source} \\
-\midrule
-before the VNNI int4 kernel & 3.65 & 67.8 GB/s & \texttt{colibri.c:541} \\
-\textbf{with AVX-512 VNNI} (automatic, if compiled for it) & \textbf{3.85} & \textbf{89.5 GB/s} & \texttt{colibri.c:541} \\
-baseline of the next campaign & 4.20 & --- & \texttt{colibri.c:554} \\
-\textbf{plus \texttt{XEXP=1}} (one thread team per block) & \textbf{4.68} & \textbf{131.9 GB/s} & \texttt{colibri.c:554} \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\vspace{0.4em}
-{\small Those runs are \textbf{CPU-side} --- none used the GPU for the dense path. Add that
-$\times$2.8 lever, partially, and you get:}
-
-\keybox{\proj\ \textbf{6--12 tok/s, most likely around 8.} A projection built from measured parts:
-a measured 4.68 tok/s floor on our CPU class, times a partial capture of a measured GPU lever. The
-first real run on our hardware replaces this line.}
-
-\vspace{0.2em}
-{\scriptsize \texttt{XEXP=1} was \textbf{neutral or negative on a 24-core box}, which is why it is
-opt-in. On 48 cores it is the largest CPU-side lever there is.}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{Four things that do not help, with evidence}
-
-\begin{center}
-\scriptsize
-\renewcommand{\arraystretch}{1.1}
-\begin{tabular}{@{}p{0.28\textwidth}p{0.64\textwidth}@{}}
-\toprule
-\textbf{The obvious idea} & \textbf{What was measured} \\
-\midrule
-More GPUs & Under 2\% once the model is RAM-resident. See the previous slide. \\[0.3em]
-More users at once & The engine \emph{serialises}. 1.32 / 1.51 / 1.46 tok/s aggregate at 1 / 2 / 4
-clients --- concurrency divides throughput, it does not scale it. \\[0.3em]
-Disk prefetch machinery & Turning it \textbf{off} was worth \textbf{+26\%}. Once experts are
-resident the disk reads 0\,MB/s, so prefetch only burns CPU --- the scarce resource. \\[0.3em]
-Maximising memory & With the dense path on the CPU, a 176\,GB configuration measured \emph{slower}
-than a 99\,GB one. Gains also do not compose. \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\vspace{0.5em}
-\keybox{\small \textbf{And one hidden trap that invalidates naive benchmarking entirely.}
-colibr\`i keeps a learned routing profile on disk that survives restarts. An \emph{identical}
-configuration measured \textbf{5.46 tok/s and then 2.56} with no parameter changed. Every
-measurement must snapshot and restore that file, or it measures nothing.}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{The real constraint is the 27-minute cold start}
-
-{\small 372\,GB off the studies share at \meas\ 230\,MB/s. That number, not the GPU, drives every
-remaining decision --- and it collides with how this cluster's partitions are configured.}
-
-\begin{center}
-\scriptsize
-\renewcommand{\arraystretch}{1.1}
-\begin{tabular}{@{}lccp{0.44\textwidth}@{}}
-\toprule
-\textbf{Partition} & \textbf{Time limit} & \textbf{Can be frozen?} & \textbf{Verdict} \\
-\midrule
-\texttt{c3\_short} & \textbf{9 h} & no & 27 min of every 9 h is a reload --- \textbf{5\% duty lost, 2.7 restarts a day} \\[0.3em]
-\texttt{c3} & 7 d & \textbf{yes, silently} & a \texttt{c3\_short} job can \texttt{SIGSTOP} it; the client just hangs \\[0.3em]
-\texttt{c3\_accel} & 7 d & no & the only long-\emph{and}-safe option --- but it is the four-GPU node we just proved we do not need \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\vspace{0.3em}
-{\small \textbf{The inversion worth noticing.} Having argued we do not need compute306's
-\emph{cards}, the strongest reason to run there is its \emph{partition} --- the only place offering
-a 7-day life with no preemption exposure.}
-
-\vspace{0.3em}
-\keybox{\small \textbf{The plan says \texttt{c3\_short}, reluctantly}, and takes the 5\%. Holding
-the only four-GPU node for a service that does not need four GPUs is indefensible. \textbf{One test
-may settle it}: a node has 1\,TB of RAM and the model is 372\,GB, so a restart on the \emph{same}
-node may find it still in page cache.}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{The system is four boxes}
-
-\begin{center}
-\resizebox{0.75\textwidth}{!}{%
+\resizebox{0.52\textwidth}{!}{%
 \begin{tikzpicture}[
-  font=\scriptsize,
-  >={Stealth[length=2mm]},
-  box/.style={draw=black!45, rounded corners=3pt, fill=black!7,
-              align=center, inner sep=4pt, minimum height=10mm, minimum width=26mm},
-  ctrl/.style={draw=blue!55!black, thick, fill=blue!12,
-               align=center, inner sep=4pt, minimum height=10mm, minimum width=30mm},
-  gpu/.style={draw=green!45!black, thick, fill=green!12,
-              align=center, inner sep=5pt, minimum height=14mm, minimum width=40mm},
-  kill/.style={draw=red!70!black, thick, fill=red!10,
-               align=center, inner sep=3pt, minimum height=8mm, minimum width=24mm},
-  flow/.style={->, thick, draw=black!75},
-  ask/.style={->, thick, draw=black!45, dashed},
+  font=\scriptsize, >={Stealth[length=2mm]},
+  co/.style={draw=blue!55!black, thick, fill=blue!12, align=center, inner sep=4pt,
+             minimum height=13mm, minimum width=34mm},
+  wk/.style={draw=green!45!black, thick, fill=green!12, align=center, inner sep=3pt,
+             minimum height=9mm, minimum width=34mm},
   lbl/.style={font=\tiny, inner sep=1.5pt}
 ]
-\node[box, minimum height=13mm]  (you)   at (0,0.8)    {\textbf{you}\\Claude Code\\(any node)};
-\node[ctrl, minimum height=13mm] (sup)   at (5.0,0.8)  {\textbf{the supervisor}\\a 2-CPU Slurm job\\one decision / 30\,s};
-\node[box]                       (slurm) at (5.0,-2.4) {\textbf{Slurm}\\\texttt{squeue}};
-\node[kill]                      (stop)  at (1.1,-2.4) {\textbf{kill switch}\\\texttt{STOP} file};
-\node[gpu] (b1) at (11.0,1.6) {\textbf{colibr\`i} --- one node\\GLM-5.2, 744B, int4\\1 GPU, 500\,GB RAM, 92 cores\\\emph{one generation at a time}};
-\node[gpu, fill=green!4, dashed] (b2) at (11.0,-1.3) {vLLM replicas (later)\\batch corpus work only\\\emph{a different job entirely}};
-
-\draw[ask] (you.east) -- node[lbl, below] {which node?} (sup.west);
-\draw[ask] ([xshift=-5mm]sup.south) -- node[lbl, left, xshift=-1mm] {what do I hold?} ([xshift=-5mm]slurm.north);
-\draw[ask] ([xshift=5mm]slurm.north) -- node[lbl, right] {who else is blocked?} ([xshift=5mm]sup.south);
-\draw[flow] (sup.east) -- node[lbl, above] {start} node[lbl, below] {drain, stop} (b1.west);
-\draw[flow, draw=red!70!black] (stop.east) to[bend right=12] node[lbl, above, pos=0.18] {always wins} (sup.south west);
-\draw[flow] (you.north) to[out=75, in=165] node[lbl, above, sloped] {the prompt goes straight there} (b1.north west);
+\node[co] (c) at (0,0) {\textbf{coordinator}\\routing + KV + attention\\1 GPU};
+\node[wk] (w1) at (6.4,1.5)  {worker 1 --- experts $\equiv$ 1};
+\node[wk] (w2) at (6.4,0.0)  {worker 2 --- experts $\equiv$ 2};
+\node[wk] (w3) at (6.4,-1.5) {worker \emph{N} --- 372/\emph{N}\,GB each};
+\draw[<->, thick] (c) -- node[lbl, above, sloped] {activations only} (w1);
+\draw[<->, thick] (c) -- (w2);
+\draw[<->, thick] (c) -- (w3);
+\node[lbl, text=black!55, align=center] at (0,-1.7) {expert $e$, layer $\ell$\\$\to$ worker $(e+\ell)\bmod N$};
 \end{tikzpicture}}
 \end{center}
 
-\vspace{-0.2em}
-{\scriptsize \textbf{The supervisor remembers nothing.} Every 30 seconds it asks Slurm what it holds
-and who is waiting, then takes \emph{one} action. It keeps no state, so a crash loses none --- and
-the backend keeps serving while it is gone.}
+\vspace{0em}
+{\scriptsize \textbf{The fabric supports it:} \texttt{mlx5\_1} is a \textbf{40 Gb/s Mellanox link,
+ACTIVE}. Six nodes reading their own slice in parallel would cut the expert phase from 92\,ms to
+about 34.}
+
+\vspace{0.3em}
+\keybox{\scriptsize \textbf{Three reasons it is P5, not P1.} The worker loop is
+\textbf{synchronous} --- $75 \times N$ sequential round trips per token, and fixing it is an
+upstream patch. A worker failure calls \texttt{exit(1)}, so one yielded node kills the service. And
+\textbf{activations cross the network in plaintext}, which for PHI-derived hidden states is a new
+exposure, not a config detail.}
 
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{What you actually type --- and it is Claude Code}
+\begin{frame}{What you actually type}
 
-{\small colibr\`i speaks the \textbf{Anthropic Messages API} on the same port as everything else,
-and GLM-5.2 supports tool calling. So the client is the one you already use --- three environment
-variables, no shim:}
+colibr\`i speaks the \textbf{Anthropic Messages API} natively, so tier 2 needs no shim:
 
-\keybox{\parbox{0.7\textwidth}{\ttfamily\small
-export ANTHROPIC\_BASE\_URL=http://127.0.0.1:8000 \\
+\keybox{\parbox{0.66\textwidth}{\ttfamily\small
+export ANTHROPIC\_BASE\_URL=http://\emph{node}:8000 \\
 export ANTHROPIC\_API\_KEY=\emph{your key} \\
-export ANTHROPIC\_MODEL=glm-5.2-colibri \\
 claude}}
 
-\vspace{0.4em}
+\vspace{0.5em}
 \begin{center}
 \scriptsize
 \begin{tabular}{@{}ll@{}}
 \toprule
 \textbf{Command} & \textbf{What happens} \\
 \midrule
-\texttt{fleet code} & sets those three, steps onto the backend's node, starts Claude Code \\
+\texttt{fleet code} & sets the environment, starts your client against tier 1 \\
+\texttt{fleet ask "\ldots"} & one question, escalated to tier 2, you wait a minute \\
 \texttt{fleet status} & what is up, what is warm, what it is waiting on \\
 \texttt{fleet up} / \texttt{fleet down} & start the supervisor / stop everything and stay stopped \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\vspace{0.4em}
-\keybox{\small \textbf{And colibr\`i has an API key, which ollama never did.} \texttt{COLI\_API\_KEY} closes
-a gap this repo has had recorded as \emph{live} since August: a loopback port is not a boundary
-against other users on the same node, and until now nothing else was one either.}
+\vspace{0.5em}
+\keybox{\small \textbf{Multi-user changes the security question, and it must be faced.} A loopback
+bind means one user per node, which defeats the point --- so tier 1 binds the cluster interface
+\textbf{with an API key}. That is a deliberate, recorded weakening of the current control.
+\textbf{Tier 3 keeps no socket at all}, which is why PHI corpus work stays there.}
 
 \end{frame}
 
@@ -385,16 +373,14 @@ against other users on the same node, and until now nothing else was one either.
 \begin{center}
 \resizebox{0.78\textwidth}{!}{%
 \begin{tikzpicture}[
-  font=\scriptsize,
-  >={Stealth[length=2mm]},
-  gen/.style={draw=blue!55!black, thick, fill=blue!12,
-              align=center, inner sep=4pt, text width=24mm, minimum height=12mm},
-  pend/.style={draw=black!45, dashed, rounded corners=3pt, fill=black!5,
-               align=center, inner sep=4pt, text width=24mm, minimum height=12mm},
-  kill/.style={draw=red!70!black, thick, fill=red!10,
-               align=center, inner sep=4pt, text width=26mm, minimum height=11mm},
-  flow/.style={->, thick, draw=black!70},
-  lbl/.style={font=\tiny, inner sep=1.5pt}
+  font=\scriptsize, >={Stealth[length=2mm]},
+  gen/.style={draw=blue!55!black, thick, fill=blue!12, align=center, inner sep=4pt,
+              text width=24mm, minimum height=12mm},
+  pend/.style={draw=black!45, dashed, rounded corners=3pt, fill=black!5, align=center,
+               inner sep=4pt, text width=24mm, minimum height=12mm},
+  kill/.style={draw=red!70!black, thick, fill=red!10, align=center, inner sep=4pt,
+               text width=26mm, minimum height=11mm},
+  flow/.style={->, thick, draw=black!70}, lbl/.style={font=\tiny, inner sep=1.5pt}
 ]
 \node[gen]  (g1) at (0,0)    {\textbf{generation 1}\\running};
 \node[pend] (g2) at (4.0,0)  {\textbf{generation 2}\\queued, waiting};
@@ -415,153 +401,69 @@ node failure, \texttt{scancel}};
 fires on \emph{any} termination. A pending job costs nothing, so the queued successor is free
 insurance.}
 
-\vspace{0.3em}
-\keybox{\small \textbf{The kill switch is a file, not a signal.} \texttt{fleet down} writes
+\vspace{0.2em}
+\keybox{\scriptsize \textbf{The kill switch is a file, not a signal.} \texttt{fleet down} writes
 \texttt{STOP} \emph{before} it cancels anything, so the successor starts, reads it, and exits in two
-seconds. It works when the supervisor is wedged and when its node is gone --- a kill switch that
-depends on the thing it kills is not one.}
+seconds. It works when the supervisor is wedged and when its node is gone.}
+
+\vspace{0.1em}
+{\scriptsize One tier-2 change: \textbf{readiness is a generated token, not a listening socket} ---
+the model takes 27 minutes to load, and an ollama-sized timeout fires at 3\% of the way through.}
 
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{Citizenship --- and where the pivot costs something}
+\begin{frame}{Citizenship --- the ask is now large, and has to be argued}
 
-\begin{center}
-\resizebox{0.92\textwidth}{!}{%
-\begin{tikzpicture}[
-  font=\scriptsize,
-  >={Stealth[length=2mm]},
-  stg/.style={draw=black!45, rounded corners=3pt, fill=black!7,
-              align=center, inner sep=4pt, text width=23mm, minimum height=15mm},
-  hot/.style={draw=orange!70!black, thick, fill=orange!15,
-              align=center, inner sep=4pt, text width=23mm, minimum height=15mm},
-  cool/.style={draw=blue!55!black, thick, fill=blue!12,
-               align=center, inner sep=4pt, text width=23mm, minimum height=15mm},
-  flow/.style={->, thick, draw=black!70}
-]
-\node[stg]  (s1) at (0,0)    {\textbf{1. see}\\a foreign job pending on \texttt{Resources}};
-\node[hot]  (s2) at (3.2,0)  {\textbf{2. drain}\\let the current answer finish};
-\node[hot]  (s3) at (6.4,0)  {\textbf{3. yield}\\give the node back};
-\node[cool] (s4) at (9.6,0)  {\textbf{4. hold off}\\do \emph{not} re-request it};
-\node[cool] (s5) at (12.8,0) {\textbf{5. regrow}\\27 minutes later};
-\draw[flow] (s1) -- (s2); \draw[flow] (s2) -- (s3);
-\draw[flow] (s3) -- (s4); \draw[flow] (s4) -- (s5);
-\end{tikzpicture}}
-\end{center}
+The standing claim is \textbf{compute306 entire, plus one \texttt{c3} node}. Bigger than either
+earlier plan. What makes it defensible:
 
-\vspace{0.5em}
-\begin{columns}[T]
-\begin{column}{0.47\textwidth}
-{\small\textbf{What survives, and it is real}
 \begin{itemize}\small
-\item We hold \textbf{one GPU of seven}, never compute306
-\item One backend. Never two. Ever.
-\item Idle release still fires --- on a 3-hour clock, not 30 minutes
-\end{itemize}}
-\end{column}
-\begin{column}{0.47\textwidth}
-{\small\textbf{What it honestly costs}
-\begin{itemize}\small
-\item A yield takes the service down for \textbf{27 minutes}
-\item $\sim$92 CPUs and 500\,GB billed continuously
-\item So it will yield \emph{reluctantly}, and rarely
-\end{itemize}}
-\end{column}
-\end{columns}
-
-\vspace{0.5em}
-{\scriptsize A 27-minute asset released over a lunch break is thrashing, and a fleet that thrashes is
-worse than a fleet that is simply smaller. If the standing cost is unacceptable, the answer is a
-shorter walltime --- not a cleverer policy.}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{vLLM is the other half, and not a competitor}
-
-colibr\`i serves \textbf{one generation at a time}, at any tuning, forever. So it cannot do corpus
-work --- and the two engines stop overlapping entirely.
-
-\begin{center}
-\small
-\begin{tabular}{@{}p{0.14\textwidth}p{0.38\textwidth}p{0.40\textwidth}@{}}
-\toprule
-& \textbf{colibr\`i} & \textbf{vLLM} \\
-\midrule
-workload & one hard question, interactively & ten thousand documents, unattended \\
-model & GLM-5.2 744B int4 & MedGemma 27B, 8-bit \\
-shape & one long-lived backend, single slot & N single-GPU replicas, batched \\
-plane & HTTP on loopback & \textbf{filesystem queue --- no socket at all} \\
-for & frontier reasoning on PHI & PSYCH-ASR Stage 3c, schema-guided JSON \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\vspace{0.5em}
-\keybox{\small \textbf{Do not build a router between these two.} They share no caller and no workload. The
-arbitration layer the original design was going to need has been deleted, which is the pivot's one
-unambiguous simplification.}
+\item \textbf{compute306 is used, not camped on.} It is the only node that can hold the tier-1
+      model, and it now serves everybody rather than one person.
+\item \textbf{Tier 1 is the rung that gets pulled.} It costs minutes to restart, so it is what the
+      fleet yields --- the ladder has more than one rung again.
+\item \textbf{Tier 2 costs \meas\ 27 minutes} to reload 372\,GB at 230\,MB/s, so its idle timeout is
+      \textbf{three hours}, not thirty minutes. A 27-minute asset released over a lunch break is
+      thrashing, and a fleet that thrashes is worse than a fleet that is simply smaller.
+\item \textbf{The yield filter is still the load-bearing part.} On the day this was written,
+      \textbf{all 27} pending jobs on the cluster were waiting on a start time they had asked for
+      --- not on resources. A naive rule would surrender everything, continuously, for nothing.
+\end{itemize}
 
 \vspace{0.4em}
-{\scriptsize The batch queue is also the strongest PHI control in the design, because it removes
-the socket entirely: a worker killed mid-item costs one item, not the pass.}
+\keybox{\small \textbf{Fair-share is no longer a rounding error.} Tier 1 bills $\sim$92 CPUs and
+four GPUs; tier 2 bills $\sim$92 CPUs and one. That lands on the PSYCH-ASR and TRD-EHR jobs this
+exists to serve, and it must be measured before and during --- not asserted to be fine.}
 
 \end{frame}
 
 %----------------------------------------------------------
-\begin{frame}{Which model, inside colibr\`i}
-
-{\small Eight families run on the same engine. The filter is brutal: it must fit in 1\,TB of RAM,
-\textbf{and} support tool calling, or a terminal client cannot drive it.}
+\begin{frame}{The measurement campaign --- this is what decides the design}
 
 \begin{center}
 \scriptsize
 \renewcommand{\arraystretch}{1.15}
-\begin{tabular}{@{}lrrcp{0.34\textwidth}@{}}
+\begin{tabular}{@{}rp{0.50\textwidth}p{0.34\textwidth}@{}}
 \toprule
-\textbf{Model} & \textbf{total / active} & \textbf{container} & \textbf{tools} & \textbf{verdict} \\
+& \textbf{Test} & \textbf{Settles} \\
 \midrule
-\textbf{GLM-5.2} & 744B / 40B & \textbf{372 GB} & \textbf{yes} & \textbf{the default} --- every number in this deck belongs to it \\
-DeepSeek V4 Flash & 284B / \textbf{13B} & 167 GB & \textbf{yes} & \textbf{measure it.} One third the active parameters could mean real speed \\
-GLM-5.3-Flash & 321B / 40B & 195 GB & yes & a lighter GLM; needs conversion \\
-Inkling & 975B / 41B & 469 GB & \textbf{no} & unusable --- rejects tool calls with HTTP 400 \\
-Kimi K3 & 2.8T / 104B & \textbf{1.6 TB} & yes & \textbf{does not fit in RAM.} Dead here \\
+1--3 & build with \texttt{ARCH=native}; stage 372\,GB; time a cold load, then a restart on the same node & the VNNI kernels, and whether 1\,TB of page cache kills the 27 minutes \\
+4 & \texttt{coli plan}, then \texttt{coli tune}, under the snapshot protocol & the real tok/s, plus OpenMP and NUMA \\
+5 & A/B \texttt{CUDA\_DENSE=1} & how much of the 57\% the GPU takes \\
+6 & \textbf{A/B one A40 against four} & the question the last version closed too early \\
+7 & A/B \texttt{XEXP}, NUMA binding, MTP depth & the remaining tier-2 levers \\
+8 & vLLM TP=4 against 2$\times$TP=2 & the PCIe all-reduce tax \\
+9 & \textbf{tier 1 under six concurrent users} & \textbf{the number this whole project is for} \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\vspace{0.5em}
-\keybox{\small \textbf{Quality is not free, and the number is known.} GLM-5.2's int4 container measures
-\textbf{$-$8.2 percentage points} against the unquantized model, concentrated on the hardest
-questions. Whether 744B at int4 beats a well-served smaller model at 8-bit \emph{for our tasks} is a
-blind side-by-side nobody has run. The pivot makes that comparison more important, not less.}
-
-\end{frame}
-
-%----------------------------------------------------------
-\begin{frame}{Build order --- and you can stop early}
-
-\begin{center}
-\scriptsize
-\renewcommand{\arraystretch}{1.15}
-\begin{tabular}{@{}llp{0.46\textwidth}@{}}
-\toprule
-\textbf{Phase} & \textbf{What lands} & \textbf{Exit criterion} \\
-\midrule
-P0 & ten verification tests & \textbf{a real tok/s number on our hardware}, under the snapshot protocol \\
-P1 & one backend, tuned, run by hand & Claude Code finishes a real task against it, with a tool call \\
-P2 & the sbatch, \texttt{fleet up} / \texttt{status} / \texttt{down} & one command, and it refuses to claim success before a token exists \\
-P3 & supervisor, chain, kill switch & survives two rollovers; \texttt{fleet down} makes it stay down \\
-P4 & idle release, caps, yield, hold-off & yields to a real blocked job, does not take the node back early \\
-P5 & vLLM + the batch queue & a corpus pass survives a worker being killed \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-\vspace{0.5em}
-\keybox{\small \textbf{Stop after P1 and you already have what was asked for}, run by hand. P2--P4 are what
-make it survive being left alone. \textbf{P0 comes first and is not optional} --- the previous plan
-could build its control plane first because ollama was already proven. Nothing here is.}
+\vspace{0.6em}
+\keybox{\textbf{And one protocol rule that is not optional.} colibr\`i keeps a learned routing
+profile on disk that survives restarts. A byte-for-byte \emph{identical} configuration measured
+\textbf{5.46 tok/s and then 2.56}. Snapshot and restore that file before every single
+configuration, or you are measuring the profile rather than the change.}
 
 \end{frame}
 
@@ -571,22 +473,24 @@ could build its control plane first because ollama was already proven. Nothing h
 \begin{center}
 \scriptsize
 \renewcommand{\arraystretch}{1.2}
-\begin{tabular}{@{}p{0.46\textwidth}p{0.24\textwidth}p{0.22\textwidth}@{}}
+\begin{tabular}{@{}p{0.48\textwidth}p{0.44\textwidth}@{}}
 \toprule
-\textbf{Question} & \textbf{Proposed} & \textbf{Cost if changed} \\
+\textbf{Question} & \textbf{Where it lands} \\
 \midrule
-Partition: 9-hour and safe, or 7-day on the four-GPU node? & \texttt{c3\_short}, reluctantly & 5\% duty lost, versus holding the scarcest node \\
-Is $\sim$92 CPUs and 500\,GB on one of six nodes, continuously, acceptable? & \textbf{it has to be} & if not, the service does not exist in this form \\
-GLM-5.2 only, or measure DeepSeek V4 Flash first? & measure both & 13B active vs 40B is a large potential speed difference \\
-Claude Code or opencode as the client? & \textbf{Claude Code} & colibr\`i speaks Anthropic natively; opencode stays as fallback \\
-\textbf{Is 6--12 tok/s acceptable for the work you have in mind?} & \textbf{as a consultant, yes} & as an agent loop, \textbf{no}, and nothing here changes that \\
+Does tier 1 bind the cluster network? & \textbf{It must}, to serve more than one node --- and that
+weakens the loopback control. Tier 3 stays socket-free regardless. \\
+Is compute306 entire, plus one \texttt{c3} node, acceptable as a standing claim? & If not, tier 1
+shrinks to a single-GPU model and the quality target moves with it. \\
+Which tier-1 checkpoint? & Task one of the build. Fits 184\,GB minus KV, int4, tool calling,
+strong at code. \\
+Claude Code everywhere, or opencode for tier 1? & colibr\`i speaks Anthropic natively; vLLM does
+not. Write a thin adapter, or accept two clients. \\
+\textbf{If tier 1 measures well, is tier 2 still worth 372\,GB and a node?} & Ask again after test
+9. GLM-5.2's int4 costs a \meas\ \textbf{$-$8.2 points}, so the quality gap is smaller than the
+parameter counts suggest. \\
 \bottomrule
 \end{tabular}
 \end{center}
-
-\vspace{0.5em}
-{\scriptsize Recorded as open in \texttt{FLEET-BUILD.md} §13. Answer them once, with a date, and the
-implementation stops guessing.}
 
 \end{frame}
 
@@ -594,29 +498,27 @@ implementation stops guessing.}
 \begin{frame}{What ``done'' looks like}
 
 \keybox{\parbox{0.9\textwidth}{\vspace{0.3em}
-You type \texttt{fleet code} and Claude Code opens against a \textbf{744-billion-parameter model
-running on LIBR hardware}, which may read PHI, because nothing leaves the building.
+Several people ssh into compute nodes, open VSCode, and type. Each gets a strong local model at
+\textbf{20--40 tokens a second}, all at the same time, on hardware the lab already owns.
 
-You ask it one hard question. It thinks for eighty seconds and answers well.
+When a question is genuinely hard, the agent calls one tool and a \textbf{744-billion-parameter
+model} answers it in a minute.
 
-Overnight the fleet releases the node. In the morning you pay 27 minutes, once, and carry on.
+None of it leaves the building, so all of it may read PHI.
 
-If a colleague's GPU job goes pending, the fleet finishes your answer and gives the node back ---
-and the log says so, with their job id, when anybody asks.
+Overnight the fleet releases what it holds. If a colleague's job goes pending, it finishes the
+current answer and gives a node back --- and the log says which job, when anybody asks.
 \vspace{0.3em}}}
 
 \vspace{0.8em}
-Nothing in that paragraph needs an administrator, a login-node daemon, or a person watching.
-
-\vspace{0.7em}
 \begin{center}
-\textbf{It is frontier-scale.} \quad \textbf{It is on-premises.} \quad \textbf{It is eight tokens a
-second.}
+\textbf{Not as fast as hosted.} \quad \textbf{Within a small factor.} \quad \textbf{And it can read
+the data.}
 \end{center}
 
-\vspace{0.3em}
+\vspace{0.4em}
 \begin{center}
-{\small Two of those three are the reason to build it. The third is why it is a consultant.}
+{\small The third one is not a consolation prize. It is the only reason this is worth building.}
 \end{center}
 
 \end{frame}

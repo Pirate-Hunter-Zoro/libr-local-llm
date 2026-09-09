@@ -1,481 +1,386 @@
-# FLEET-BUILD.md — the build runbook for a colibrì-centred inference service
+# FLEET-BUILD.md — the build runbook for a tiered local inference service
 
 **Point a fresh session at this file.** It is the implementation plan for a local inference service
-built around **colibrì** running a frontier MoE model on LIBR compute: acquired when free, given
-back when somebody else needs it, restarted when it dies, and reachable from a terminal client on
-any node.
+on LIBR compute that several people can ssh into and work against from a VSCode terminal, with
+frontier-scale reasoning available when a question needs it.
 
-**Revised 2026-09-09, second pass.** The first pass planned a three-engine fleet with ollama as the
-daily driver. That is withdrawn. ollama's models (`qwen3-coder:30b`, `gpt-oss:120b`) are judged
-inadequate in quality and reasoning for the work this is for, so the service is now built around
-colibrì, which is the only engine here that can run a frontier-scale model at all. vLLM survives
-with a narrowed, non-overlapping job (§8). Everything about the supervisor, the restart chain, and
-the kill switch is unchanged and is still §5.
+**Revised 2026-09-09, third pass.** Pass one planned a three-engine fleet with ollama as the daily
+driver; pass two replaced it with colibrì alone on one node. **Both were wrong about the shape.**
+Pass two also carried two factual errors, corrected in §2. The service is now **three tiers on
+different hardware**, because the bottleneck analysis in §3 says no single engine can be both fast
+for many people and deep for one.
 
-Read in this order before writing a line: [`AI_INSTRUCTIONS.md`](AI_INSTRUCTIONS.md),
-[`README.md`](README.md), [`DESIGN.md`](DESIGN.md), then this file. A 16-slide plain-language
-walkthrough is [`docs/fleet_walkthrough.pdf`](docs/fleet_walkthrough.pdf) (source
-`docs/fleet_walkthrough.tex`).
+Read first: [`AI_INSTRUCTIONS.md`](AI_INSTRUCTIONS.md), [`README.md`](README.md),
+[`DESIGN.md`](DESIGN.md). Plain-language walkthrough:
+[`docs/fleet_walkthrough.pdf`](docs/fleet_walkthrough.pdf).
 
-**No sudo, anywhere, at any step.**
+**No sudo, anywhere.**
 
 ---
 
 ## 1. The verdict
 
-**Buildable: yes. And the pivot to colibrì is better supported by the evidence than the plan it
-replaces** — this hardware is unusually well matched to how colibrì works, for a reason nobody had
-noticed: **1 TB of RAM per node.**
+**What you can have:** several people, each in their own VSCode terminal, talking to a strong local
+model at **20–40 tok/s**, with a **744B model reachable as an escalation** when a question deserves
+it. That is close enough to the hosted experience that the difference is noticeable but not
+disabling.
 
-**The speed is 4–8 tok/s and that is a measurement, not a fear.** It does not get better with more
-GPUs. §3 is the arithmetic and §3.4 is where the evidence comes from.
+**What you cannot have:** the 744B model itself at conversational speed for everyone. §3.3 is the
+arithmetic and it is not a tuning problem — it is a property of top-8-of-256 expert routing.
 
-Three consequences, stated up front because everything below follows from them:
+The gap to a hosted frontier assistant, stated once and honestly:
 
-1. **This is a consultant, not an agent loop.** At 6 tok/s a 500-token answer takes 80 seconds and a
-   2,000-token answer takes five and a half minutes. Asking one hard question and waiting is
-   entirely reasonable. Driving forty tool calls through it is not, and no amount of engineering
-   changes that.
-2. **The four-GPU node buys almost nothing here, and that is the surprise.** With 1 TB of RAM the
-   whole 372 GB model is RAM-resident, and colibrì's own controlled measurement puts the VRAM-versus
-   -RAM placement difference at **under 2 %** once that is true. What the GPU is for is the *dense
-   and attention* tensors — about 23 GB, which fits on **one** A40. compute306 is not needed for
-   capacity.
-3. **The cold start, not the GPU, is the hard constraint.** 372 GB off the studies share at a
-   measured ~230 MB/s is **~27 minutes** before the first token. That single number drives the
-   partition choice (§4), the citizenship design (§7), and why this service cannot be treated as
-   yieldable in the way an ollama server was.
-
----
-
-## 2. What colibrì is, in one paragraph
-
-A 744B-parameter MoE activates ~40B parameters per token, and only the routed experts change from
-token to token. colibrì therefore does not load the model — it **places** it. The dense part
-(attention, shared experts, embeddings, ~17B params, ~9.9 GB at int4) stays resident; the 19,456
-routed experts (~19 MB each) live across VRAM, RAM and disk as tiers of one hierarchy, staged on
-demand with a per-layer LRU, a learned pinned hot-store, and one-layer-ahead prefetch. Placement
-decides *speed only*: the router's decisions and the weights' precision are identical whether an
-expert answered from VRAM or from disk. It is a single C file, no BLAS, no Python at runtime, and
-it serves exactly one generation at a time.
-
----
-
-## 3. The performance model — where the speed comes from and where it stops
-
-This is the section to read before arguing about hardware. Everything is bandwidth arithmetic on a
-per-token expert working set.
-
-### 3.1 The governing equation
-
-From colibrì's own instrumented run (`docs/experiments/glm52-4xa6000-2026-08-02.md` §5):
-
-```
-expert weights touched per token = 8 experts × 20.1 MB × 75 layers = 12.1 GB
-time per token ≈ (bytes served from RAM) / (achieved RAM read bandwidth)
-```
-
-That is the whole ceiling. Everything else — tiering, pinning, context length, KV width — is
-bounded above by it. On the 4×A6000 reference host the CPU-side routed path sustained
-**19.67 GB/s** against ~85 GB/s of theoretical DDR4-2400, i.e. 23 % of the machine, and the
-resulting ceiling was **3.0 tok/s**.
-
-### 3.2 Why our node is the good case
-
-| | reference host (4×A6000) | **LIBR compute30x** |
-|---|---|---|
-| CPU | EPYC 7402P, Zen 2, 24c/48t, **AVX2 only** | 2× Xeon Gold 6342, Ice Lake-SP, **48c/96t**, **AVX-512 + VNNI** |
-| NUMA | 1 node | **2 nodes**, 515 GB each, distance 20 |
-| RAM | 264 GB DDR4-2400, ~85 GB/s | **1 TB DDR4-3200**, ~410 GB/s across two sockets |
-| model residency | 367 of 429 GB — **disk stays in the path** | **372 GB of 1 TB — the entire model, RAM-resident, disk leaves the decode path permanently** |
-| GPU | 4× A6000 48 GB, sm_86 | 1–4× A40 46 GB, **sm_86 — same generation** |
-| storage | local NVMe, 2.86 GB/s | NFS, **0.23 GB/s** — 12× worse, and it only affects cold start |
-
-Two of those matter and the rest are detail. **AVX-512 VNNI** gives the int4 dot-product kernels a
-path the reference host did not have, and colibrì selects it automatically at compile time. **1 TB
-of RAM** removes disk from decode entirely, which is the configuration behind every good number in
-colibrì's experiment set and which the reference host could not reach.
-
-### 3.3 What the GPU is actually for
-
-`CUDA_DENSE=1` was worth **×2.8** on the reference host (1.53 → 4.26 tok/s) and is **not mentioned
-in colibrì's public README**. It moves the dense and attention tensors onto the GPU. It was decisive
-because attention dominates decode as a generation lengthens — 64 % of decode time on a 750-token
-answer, 26 % on a 64-token one.
-
-Those tensors cost ~12 GB, plus ~11 GB of KV cache at 32k context. **23 GB — one A40 holds it.**
-
-What four cards would add is expert residency in VRAM, and colibrì's own controlled A/B says that is
-worth almost nothing once RAM residency is achieved: VRAM-heavy (188 GB) measured 2.81 tok/s against
-balanced (176 GB) at 2.78 — indistinguishable — while raising the *RAM* budget from 205 to 235 GB
-bought **+25 %**. An arithmetic check in the same report puts the VRAM/RAM bandwidth differential at
-~1.3 ms of a 77 ms token, **under 2 %**.
-
-> **Therefore: one A40, not four.** This is the same conclusion `DESIGN.md` §4.1 reached, but for a
-> stronger reason than it had. It also means the service never touches compute306 for capacity,
-> which is the best citizenship story available to us.
-
-### 3.4 The number, and where it comes from
-
-colibrì's source carries measurements taken on a **2-socket Ice Lake 48-core host with GLM-5.2 int4
-fully resident** — the same CPU generation, core count, and residency condition as ours. From
-`c/colibri.c`:
-
-| condition | tok/s | expert-matmul | source |
+| | hosted | **this service, tier 1** | **this service, tier 2** |
 |---|---|---|---|
-| int4 IDOT off at S=1 (pre-VNNI baseline) | 3.65 | 67.8 GB/s | `colibri.c:541` |
-| **AVX-512 VNNI int4 IDOT** (automatic when compiled for it) | **3.85** | **89.5 GB/s** | `colibri.c:541` |
-| baseline in the XEXP campaign | 4.20 | — | `colibri.c:554` |
-| **+ `XEXP=1`** (one OpenMP region per batch-union block) | **4.68** | **131.9 GB/s** | `colibri.c:554` |
+| speed | 50–100 tok/s | **20–40 tok/s** *(projected)* | **8–12 tok/s** *(projected)* |
+| concurrent users | many | **many** | **one** |
+| model | frontier | ~200–250B MoE at int4 | **744B at int4** |
+| reads PHI | never | **yes** | **yes** |
 
-Those runs are **CPU-side**; none of them mentions `CUDA_DENSE`. Adding one A40 to take the dense
-and attention path is the ×2.8 lever on a host where the CPU was the bottleneck — ours is far
-stronger, so expect less, but attention is 26–64 % of decode and moving it is aimed at the phase
-that dominates.
-
-> **Projected: 6–12 tok/s, most likely around 8.** *Projection*, from measured components: a
-> measured 4.68 tok/s CPU-side floor on our CPU class, times a partial capture of a measured ×2.8
-> GPU lever. The first real measurement replaces this line.
->
-> `XEXP=1` was **neutral or negative on a 24-core box** and is opt-in for that reason. On 48 cores it
-> is the single largest CPU-side lever available. Measure it; do not assume it.
-
-### 3.5 What does not help, with evidence
-
-- **More GPUs** — §3.3. Under 2 % once RAM-resident.
-- **Concurrency.** The engine serialises: 1.32 / 1.51 / 1.46 tok/s aggregate at 1 / 2 / 4 clients.
-  Two measurement clients at once produce erratic numbers and must be discarded. A colibrì backend
-  is a **single-slot resource**; queue for it, never load-balance onto it.
-- **Prefetch machinery, once resident.** Removing `URING` + `PILOT*` was worth **+26 %**: with
-  experts resident the disk reads 0 MB/s during decode, so the overlap machinery only consumes CPU,
-  which is the scarce resource. Keep `DIRECT=1 PIPE=1`.
-- **Maximising memory blindly.** With the dense path on the CPU, a 176 GB/188 GB configuration
-  measured *slower* than a 99 GB one. Gains do not compose; two settings aimed at the same residual
-  miss do not add.
-- **Longer context, for free.** Decode falls 23 % going from 32k to 131k, with no cliff up to 196k
-  and prefill flat at 148–198 tok/s. `CTX=131072` is the recommended point.
-
-### 3.6 The NUMA question, which is ours alone to answer
-
-The reference host was single-socket. We have **two NUMA nodes of 515 GB each, distance 20**, and
-the model is 372 GB. Two configurations, and they are genuinely different machines:
-
-- **One socket.** `numactl --cpunodebind=0 --membind=0`. 24 cores, ~205 GB/s, every expert access
-  local. **The model fits inside one NUMA node with 143 GB to spare** — this is the clean case, and
-  it is not obvious it loses.
-- **Both sockets interleaved.** `COLI_NUMA=1`. 48 cores, ~410 GB/s aggregate, but half of all expert
-  reads cross UPI at 2× the latency. This is the configuration the 4.68 tok/s figure came from.
-
-`coli tune` sweeps OpenMP thread count and NUMA policy on the real model and machine, and
-disqualifies any candidate whose greedy output drifts by a byte. Use it rather than guessing — and
-note that colibrì's own report names the thread-count sweep as *"the single most valuable
-measurement still outstanding"* on this axis.
+**Tier 1 is the answer to your actual question.** A ~235B-class MoE with 20-ish billion active
+parameters, served by vLLM with continuous batching on compute306's four A40s, is within a small
+factor of the hosted experience on both axes and serves everyone at once. Tier 2 is where the 744B
+lives, and it is a consultant the agent calls, not the thing you type at.
 
 ---
 
-## 4. Placement, and the partition problem that has no clean answer
+## 2. Two corrections to the previous revision
 
-The colibrì backend wants: **1 GPU, ~500 GB RAM, as many cores as the node will give, and a life
-long enough that a 27-minute cold start amortises.**
+### 2.1 colibrì is **not** single-user. It has continuous batching, and I said otherwise.
 
-`MaxMemPerCPU=12000` couples the memory ask to the CPU ask (`README.md`, and §2.2 of the previous
-revision): 500 GB forces at least 42 CPUs, and we want the cores anyway. `MaxCPUsPerNode=92`.
-So the honest description of the ask is **`--gres=gpu:1 --cpus-per-task=92 --mem=500G`, which is
-essentially one whole node of the six.** Say that out loud in any conversation about this service;
-it is not a small job wearing a small costume.
+`docs/serve_protocol.md` documents two protocols. **`SERVE_BATCH=1` selects `run_serve_mux`:
+continuous batching with up to 16 KV slots** (the code accepts up to 512 on one path). *"Prefill is
+serial; decode is continuously batched — every active slot contributes one row per forward."* Each
+slot holds one conversation's KV and reuses the common prefix across stateless HTTP turns.
 
-Now the partition, and this is the genuinely hard part:
+I based "one generation at a time" on `docs/api.md` and on a measured 1.32 / 1.51 / 1.46 tok/s at
+1 / 2 / 4 concurrent clients. **That measurement was taken on a host where the experts were not
+resident** (151 GB RSS, no VRAM column) — extra slots thrashed the expert cache. It does not
+transfer to a fully-resident configuration.
 
-| partition | time limit | preemption exposure | GPUs | verdict |
+It also does not rescue us, but for a completely different reason, and the reason is §3.3.
+
+### 2.2 "Four GPUs are worth under 2 %" was colibrì's number on a CPU-starved host, not ours.
+
+That A/B was run where the CPU-side expert path sustained **19.67 GB/s against ~85 GB/s of
+available memory bandwidth** — 23 % of the machine. Placement could not matter, because the CPU
+could not consume faster from either tier. On a host that pulls **131.9 GB/s** the comparison is
+open again: A40 HBM is ~696 GB/s, so experts served from VRAM arrive **~5× faster** than from RAM.
+
+Corrected: **the four-GPU question is open and is a measurement we owe** (§9 test 6), not a settled
+"one card is enough". The arithmetic in §3.4 says four cards could be worth ~1.6× on the expert
+phase. It also says that is not where the biggest win is.
+
+---
+
+## 3. Where the time actually goes — the analysis that drives everything
+
+### 3.1 The split, from colibrì's own instrumentation
+
+On a **2-socket Ice Lake 48-core host with GLM-5.2 int4 fully resident** — our CPU class — colibrì
+measures **4.68 tok/s** with `XEXP=1`, and reports expert-matmul running at an effective
+**131.9 GB/s** (`c/colibri.c:554`).
+
+```
+4.68 tok/s                      = 214 ms per token
+expert read: 12.1 GB / 131.9 GB/s =  92 ms   (43 %)
+everything else                  = 122 ms   (57 %)   attention, dense, router, orchestration
+```
+
+The 43/57 split matches the independent profile on the 4×A6000 host (expert-matmul 46.2 %,
+attention 26.2 %). **Two halves, roughly equal.** Amdahl therefore caps every single-sided
+optimisation at under 2×, and that is the fact pass two missed.
+
+### 3.2 The expert-read half: what raises 131.9 GB/s
+
+| lever | effect on the 92 ms | status |
+|---|---|---|
+| **VRAM residency** (4× A40 = 184 GB of a 372 GB model, at ~696 GB/s) | 92 → **55 ms** | §2.2 — open, worth measuring |
+| **Cluster mode** — N nodes each read their own 1/N slice in parallel | 92 → **~34 ms** at N=6 | §5, real but the code needs work |
+| more RAM | nothing. Already fully resident | closed |
+
+### 3.3 Why batching and speculation both fail here — the deep result
+
+Both tricks produce several tokens per forward pass. Both are defeated by the same arithmetic.
+
+GLM-5.2 routes **top-8 of 256** experts per layer. Processing B tokens in one forward reads the
+**union** of their experts:
+
+```
+E[distinct experts] = 256 × (1 − (1 − 8/256)^B)
+
+B =  1  →   8.0 experts   (1.0× the bytes,  1 token)
+B =  5  →  37.6           (4.7× the bytes, ≤5 tokens)
+B =  8  →  57.4           (7.2× the bytes,  8 tokens)
+B = 16  →  99.5           (12.4× the bytes, 16 tokens)
+```
+
+**The union grows almost linearly with the batch.** Expert bytes per token barely fall, so the 43 %
+half of the budget does not amortise. Only the 57 % half does.
+
+Working it through at `KV_SLOTS=8`: expert phase 57.4 experts → 86 GB → 652 ms; everything else
+~150 ms; total ~800 ms for 8 tokens. That is **10 tok/s aggregate and 1.25 tok/s each** — better
+in total than 4.68, far worse for the person waiting.
+
+Speculation is the same shape. MTP with depth 4 verifies ≤5 tokens for 4.7× the expert bytes; at a
+70 % acceptance rate it returns roughly **1.35×**. colibrì's own note that MTP *"measured a 32 %
+loss around 85 % expert hit"* is this arithmetic biting.
+
+> **Conclusion, and it is the one that reshapes the design:** for a 744B top-8-of-256 model, more
+> tokens per pass buys aggregate throughput at the cost of per-user latency. **You cannot batch
+> your way to a fast frontier model here.** Multi-user speed has to come from a *different model*,
+> not a different setting.
+
+There is one exception worth keeping: **`KV_SLOTS=1` and MTP speculation are mutually exclusive in
+the engine** — *"MTP/n-gram speculation is not ragged-safe across KV slots, so multi-slot serve
+keeps one scheduler owning every forward (`g_draft=0`)"*. Since we are not batching tier 2 anyway,
+run it at `KV_SLOTS=1` and take the speculation. Grammar-forced drafts stay safe at any slot count.
+
+### 3.4 The other half: what raises the 122 ms
+
+`CUDA_DENSE=1` moves the dense and attention tensors to the GPU. Measured **×2.8** end-to-end on a
+host whose CPU was the bottleneck (1.53 → 4.26 tok/s), and it is **not mentioned in colibrì's public
+README**. Those tensors cost ~12 GB plus ~11 GB of KV at 32k — 23 GB, one A40.
+
+Our CPU is far stronger than that host's, so expect less. Halving 122 ms is a reasonable planning
+assumption and is itself a measurement (§9 test 5).
+
+### 3.5 Putting it together for tier 2
+
+| configuration | expert | other | total | tok/s |
 |---|---|---|---|---|
-| `c3_short` | **9 h** | none (`PriorityTier=20`, `PreemptMode=OFF`) | 1 | safe, but 27 min of every 9 h is a cold start — **5 % duty lost, 2.7 restarts a day** |
-| `c3` | 7 d | **`SIGSTOP` by any `c3_short` job** (tier 10, `SUSPEND`) | 1 | long enough, but a suspended generation hangs the client with no error (§9.1) |
-| `c3_accel` | 7 d | **none in practice** — no higher-tier partition contains compute306 | 4 | the only place offering *both* a long life and no preemption |
+| measured, CPU only, fully resident, `XEXP=1` | 92 | 122 | 214 ms | **4.68** (measured) |
+| + `CUDA_DENSE=1`, one A40 | 92 | ~61 | 153 ms | ~6.5 |
+| + four A40s (VRAM expert tier) | ~55 | ~61 | 116 ms | ~8.6 |
+| + MTP speculation at `KV_SLOTS=1` | — | — | — | **~10–12** |
+| + cluster mode across 6 nodes *(instead of 4 GPUs)* | ~34 | ~61 | 95 ms | ~10.5 |
 
-**The inversion worth noticing:** having argued in §3.3 that we do not need compute306's cards, the
-strongest reason to run there is its *partition*, not its GPUs. It is the only combination on this
-cluster of a 7-day limit and no preemption exposure, and a 27-minute cold start is exactly the
-workload that cares.
-
-That is decision 1 in §11 and it is not mine to make. The plan's default is **`c3_short` with the
-restart chain**, because holding the cluster's only four-GPU node for a service that measurably does
-not need four GPUs is indefensible however convenient the partition is. Take the 5 %.
-
-**Page cache is the mitigation nobody has costed.** A node has 1 TB of RAM and the model is 372 GB.
-A restart that lands on the *same* node may find much of the container still in page cache and skip
-most of the 27 minutes. Measure it in P0 (test 9); if it holds, `c3_short` plus `--nodelist` affinity
-becomes much cheaper than the table above suggests, and the argument for `c3_accel` weakens further.
+**Projected, from measured components.** The first row is the only measurement; every row below it
+is a modelled multiplier and the campaign in §9 replaces them.
 
 ---
 
-## 5. The supervisor, the chain, and the kill switch
+## 4. The architecture: three tiers on different hardware
 
-**Unchanged from the previous revision.** A 2-CPU Slurm job on `c3_short` that derives everything
-from `squeue` and keeps no inventory state, submits its own successor at birth with
-`--dependency=afterany:$SLURM_JOB_ID`, checks `${FLEET_STATE}/STOP` before anything else, and takes
-one action per 30-second cycle with the reason logged. `fleet down` writes `STOP` first, then
-cancels. A systemd `--user` timer is the once-a-day backstop, on the same `Persistent=true` pattern
-as `colibri-pull` and `harden-claude`, and for the same reason: crontab is refused by PAM here.
+```
+                    ssh + VSCode terminal, any node
+                                  |
+                        Claude Code / opencode
+                                  |
+        +-------------------------+--------------------------+
+        |                                                    |
+   TIER 1  the daily driver                          TIER 2  the consultant
+   vLLM, compute306, 4x A40 TP=4                     colibri, one c3 node
+   ~200-250B MoE at int4 (~120 GB)                   GLM-5.2 744B int4, 372 GB
+   continuous batching, MANY USERS                   KV_SLOTS=1 + MTP speculation
+   20-40 tok/s each          (projected)             8-12 tok/s, ONE at a time
+        |                                                    ^
+        |  the agent loop runs here                          |
+        +------------- "ask the big model" tool -------------+
 
-Two changes the pivot forces:
+   TIER 3  batch corpus work -- vLLM replicas on the remaining c3 nodes,
+           filesystem work queue, no socket at all.  PSYCH-ASR Stage 3c.
+```
 
-- **Readiness is not "listening".** colibrì takes ~27 minutes to first token. A readiness timeout
-  written for ollama fires at 3 % of the way through and the supervisor concludes the backend failed
-  — `DESIGN.md` §14.3 anticipated exactly this. Readiness is `GET /health` answering **and** a
-  one-token generation completing. Timeout 45 minutes, not 5.
-- **The fair-share arithmetic gets worse and the answer is the same.** The supervisor's own 2-CPU
-  floor still costs roughly our entire current recent usage if it runs around the clock (previous
-  revision §2.3). `idle_exit_minutes: 120` stays the default. But note the colibrì backend itself
-  now bills ~92 CPUs whenever it exists, which dwarfs the supervisor entirely — the honest framing
-  is that **the backend is the fair-share cost and the supervisor is a rounding error.**
+### 4.1 Why this is the right shape
+
+- **Tier 1 does what colibrì structurally cannot: serve many people fast.** A ~20B-active MoE has a
+  far smaller expert union per token and vLLM's continuous batching is built for exactly this. It
+  is also a *much* better model than the `qwen3-coder:30b` q4 GGUF that was judged inadequate —
+  roughly eight times the parameters, at int4 rather than q4, with vLLM's full-context sampling
+  rather than ollama's defaults. Judge the tier, not the memory of the old one.
+- **Tier 2 is reached the way a person reaches an expert: deliberately, for one hard question.** An
+  agent loop makes dozens of cheap calls and a few expensive ones. Routing every call to a 10 tok/s
+  model wastes the model and the person.
+- **compute306 finally has a defensible use.** 184 GB of VRAM is the only place on this cluster a
+  ~120 GB model fits, and a multi-user service is worth the cluster's only four-GPU node in a way a
+  single-user one never was. This **reverses** pass two's recommendation, and the reason is that the
+  node is now serving everybody.
+- **No router between tier 1 and tier 3.** They share no caller. Tier 2 is reached by an explicit
+  tool call, not by a quality heuristic — automatic cascade is research-grade and unreliable
+  (`DESIGN.md` §5.5).
+
+### 4.2 Tier 1 model selection — a real task, not a footnote
+
+Requirement: fits in **184 GB minus KV cache**, so a ~110–130 GB checkpoint; MoE with ≲30B active
+for speed; **tool calling**; strong at code and reasoning. That points at a 200–250B-parameter MoE
+quantized to int4 (AWQ or GPTQ/Marlin — **no FP8, Ampere has no FP8 tensor cores**).
+
+Do not take a model name from this document. **Selecting it is task one of P1**: enumerate what is
+actually available at that size with a working AWQ/GPTQ int4 checkpoint and tool-calling support,
+then measure two candidates on real tasks from our own repos before committing 120 GB of download.
+
+**Tensor parallelism across four cards has a cost here**: NVLink reports all links inactive, so
+TP=4 pays an all-reduce over PCIe on every layer. For a 20B-active MoE that all-reduce is on hidden
+states and is small, but it is measured, not assumed (§9 test 8). The alternative — two TP=2
+replicas — is worth the A/B.
 
 ---
 
-## 6. The front door — and colibrì hands us a better one than opencode
+## 5. Cluster mode: real, and not yet ready
 
-colibrì's HTTP server speaks **three** protocols on one port: OpenAI `/v1/chat/completions`, the
-**Anthropic Messages API at `/v1/messages`**, and its own. GLM-5.2 supports OpenAI `tools` *and*
-Anthropic `tool_use`, with `<tool_call>` blocks natively.
+colibrì can shard experts across machines. The coordinator keeps token generation, routing and KV
+state local; **expert workers on other nodes execute the routed FFNs**; only activations cross the
+wire.
 
-That means **Claude Code itself points at the local model with three environment variables** —
-`ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` — with no shim and no translating
-proxy. The terminal experience the user actually wants is the one they already have, against local
-weights.
+**The fabric supports it.** `mlx5_1` / `eth5` is a **40 Gb/s Mellanox link, ACTIVE**, in Ethernet
+mode. At S=1 decode the traffic is ~20 KB per expert each way, ~24 MB per token across 75 layers —
+about 5 ms at 40 Gb/s.
 
-Prefer it to opencode for this service, and keep opencode configured as the fallback. Three things
-that follow:
+**How it works** (`c/colibri.c:3146`): expert `e` in layer `l` is owned by worker `(e + l) % N`, a
+static hash. Each worker holds 1/N of the model and its reads land in that node's page cache — six
+nodes with 1 TB each, caching 62 GB apiece, is comfortable.
 
-- **colibrì has an API key and ollama does not.** `COLI_API_KEY` closes the gap recorded as live in
-  `README.md` §7.20: loopback is not a boundary against other users on the same node, and until now
-  nothing else was. **Set it on every backend that exists.** This is a strict improvement in the PHI
-  posture, and it is the reason `DESIGN.md` §9 named "does this engine support an API key" as a
-  selection criterion.
-- **`KVSAVE=0` is mandatory on any PHI path.** colibrì persists conversation KV state to a dot-file
-  **inside the model directory** by default, roughly 182 KB per token, so that conversations reopen
-  warm. Pointed at a model on the studies share that is PHI-derived state accumulating on shared
-  storage. Turn it off, and keep the slot-to-slot KV prefix adoption disabled too.
-- **The cross-node problem is unchanged**, and so is the answer: `srun --overlap` stdio relay (§7.2
-  of the previous revision), or simply step onto the backend's node. With one long-lived backend
-  instead of an elastic pool, stepping on is very nearly good enough, and the relay drops to a
-  convenience rather than a requirement.
+**Three reasons it is not the P1 answer:**
 
-`COLI_MAX_QUEUE` (default 8) and `COLI_QUEUE_TIMEOUT` (default 300 s) give a bounded FIFO with
-OpenAI-shaped 429s and a `x-colibri-queue-wait-ms` header. That is the single-slot queueing
-`DESIGN.md` §5.5 asked for, already built.
+1. **The worker loop is synchronous.** The coordinator sends to worker 0, *blocks* for its reply,
+   then worker 1. That is `75 layers × N` sequential round trips per token. Parallelising it is an
+   upstream patch, and without it the gain is largely eaten.
+2. **A worker failure calls `exit(1)`.** One yielded node kills the whole service. Unacceptable for
+   a fleet whose entire premise is yielding.
+3. **Activations cross the network in plaintext.** Hidden states derived from a PHI prompt on a
+   shared cluster fabric is a new exposure, not a config detail. It needs an explicit decision
+   (§11) and probably a cluster-network-only bind with `COLI_API_KEY`.
+
+**Verdict: P5, behind a measurement and an upstream patch.** Its ceiling (§3.5) is about the same as
+four GPUs on one node, for far more risk. Revisit if the four-GPU measurement disappoints.
 
 ---
 
-## 7. Citizenship, under a service that cannot cheaply be given back
+## 6. The front door
 
-This is where the pivot costs something real and the plan should not pretend otherwise.
+colibrì serves the **Anthropic Messages API at `/v1/messages`** alongside OpenAI
+`/v1/chat/completions`, with GLM-5.2 supporting tools in both shapes. **Claude Code points at it
+with three environment variables** — `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` —
+no shim. vLLM serves OpenAI-compatible HTTP, which Claude Code does not speak natively, so tier 1
+needs either opencode or a thin Anthropic-shaped adapter in front of vLLM. **Deciding that is §11
+decision 4** and it materially affects the daily experience.
 
-An ollama replica was 18.6 GB and came back in 90 seconds, so yielding it was nearly free. A
-colibrì backend holds ~500 GB of RAM and a whole node's cores for 27 minutes of reload. **The yield
-ladder still applies but it now has one rung**, and pulling it takes the service down for half an
-hour.
+**Multi-user changes the network question.** A loopback bind means one user per node, which defeats
+the point. Tier 1 must be reachable from other nodes, so it binds the cluster interface **with an
+API key**, and that is a deliberate, recorded weakening of the current control — `DESIGN.md` §5.4
+option C, which it says needs an explicit decision rather than a config edit.
 
-What survives, and it is not nothing:
+The mitigation is the two-plane split `DESIGN.md` §5.4 recommends and it should be built in from the
+start: **tier 3 (PHI corpus work) stays on the filesystem queue with no socket at all**, and tier 1
+is the conversational plane. One router serving both is how they get confused.
 
-- **We hold one GPU of seven, and never compute306.** The scarcest resource on the cluster is
-  untouched. That is a better citizenship position than the previous plan's two-of-six.
-- **Hard caps still bind.** One backend. Never a second. Never `c3_accel` without an explicit
-  request.
-- **Idle release still applies, on a much longer clock.** Nothing has used it in `idle_release_minutes`
-  → give the node back. Default **180 minutes**, not 30: releasing a 27-minute asset over a lunch
-  break is the thrashing `DESIGN.md` §10 warns about, where a fleet that thrashes is worse than a
-  fleet that is simply smaller.
-- **The hold-off is unchanged and still the first bug to expect.** Do not re-request until the
-  triggering job is no longer pending, floor 15 minutes.
-- **The yield predicate is unchanged and the `BeginTime` filter is still the load-bearing part** —
+`COLI_API_KEY` and `KVSAVE=0` are mandatory on tier 2. colibrì persists conversation KV to a
+dot-file **inside the model directory** by default — roughly 182 KB per token of PHI-derived state
+on a shared filesystem.
+
+---
+
+## 7. Citizenship, revised for a service that is now genuinely large
+
+The standing claim is now **compute306 entire, plus one c3 node**. That is a much bigger ask than
+either previous revision and it has to be argued rather than assumed.
+
+- **compute306 is used, not camped on.** A multi-user service on the only node that can hold the
+  model is the intended use of that hardware. Hold it with a real walltime, publish the status, and
+  release it when idle.
+- **Tier 2 costs 27 minutes to restart** (372 GB at a measured 230 MB/s), so it yields reluctantly
+  and its idle timeout is **180 minutes**, not 30. A 27-minute asset released over a lunch break is
+  the thrashing `DESIGN.md` §10 warns about.
+- **Tier 1 costs minutes, so it is the rung that gets pulled.** The yield ladder finally has more
+  than one rung again: idle tier-3 replica, then tier 1, then tier 2 last.
+- The yield predicate is unchanged and the **`BeginTime` filter is still the load-bearing part** —
   every pending job on this cluster on 2026-09-09 was `BeginTime`, not `Resources`.
-
-**What must be recorded honestly:** yielding this service costs the user 27 minutes of downtime, so
-the supervisor will do it reluctantly and rarely, and the fair-share bill for ~92 CPUs is paid
-continuously while it exists. If that is not acceptable, the answer is a shorter walltime and more
-frequent release, not a smarter policy.
+- **Fair-share.** Tier 1 bills ~92 CPUs and 4 GPUs; tier 2 bills ~92 CPUs and 1 GPU. This is no
+  longer a rounding error against our own pipeline jobs and must be measured before and during
+  (`DESIGN.md` §13).
 
 ---
 
-## 8. vLLM — narrowed, and now clearly not in competition
+## 8. Supervisor, chain, kill switch — unchanged
 
-colibrì serves **one generation at a time**. It cannot do corpus work, at any tuning, ever. So the
-two engines stop overlapping entirely and the router that was going to arbitrate between them is not
-needed:
+A 2-CPU job on `c3_short` that derives everything from `squeue`, keeps no inventory state, submits
+its successor at birth with `--dependency=afterany:$SLURM_JOB_ID`, checks `${FLEET_STATE}/STOP`
+first, takes one action per 30 s cycle with the reason logged, and is backstopped by a daily
+systemd `--user` timer with `Persistent=true`. `fleet down` writes `STOP`, then cancels.
 
-| | colibrì | vLLM |
-|---|---|---|
-| workload | one hard question, interactively | ten thousand documents, unattended |
-| model | GLM-5.2 744B int4 | MedGemma 27B, 8-bit |
-| shape | one long-lived backend, single slot | N single-GPU replicas, continuous batching |
-| plane | HTTP on loopback, Anthropic protocol | **filesystem work queue, no socket at all** |
-| why | frontier reasoning on PHI | PSYCH-ASR Stage 3c, schema-guided JSON |
-
-vLLM keeps `DESIGN.md` M0/M1 unchanged: user-local conda prefix, single-GPU replicas rather than
-tensor-parallel shards (no NVLink, and a replica is yieldable one at a time), driven by a filesystem
-work queue on the studies share with atomic-rename claiming. That queue is the strongest PHI control
-in the whole design because it removes the socket entirely, and it is preemption-tolerant for free.
-
-**Do not build a router between these two.** They share no caller and no workload.
+Two tier-2 adjustments: **readiness is a generated token, not a listening socket** (27-minute load;
+a timeout written for ollama fires at 3 % — `DESIGN.md` §14.3 anticipated this), timeout 45 minutes.
+And **heartbeats go in a file on NFS home**, read by content and never by mtime, so health checking
+costs the scheduler nothing.
 
 ---
 
-## 9. The model menu inside colibrì
-
-Eight families run on the same engine. Only these are viable here, and the filter is brutal: it must
-fit in 1 TB of RAM, and it must support tool calling or it cannot drive a terminal client.
-
-| model | total / active | container | tool calling | verdict |
-|---|---|---|---|---|
-| **GLM-5.2** | 744B / 40B | **372 GB** | **yes** (OpenAI + Anthropic) | **the default.** The reference model, the best-measured path, the one every number in §3 belongs to |
-| **DeepSeek V4 Flash** | 284B / **13B** | 167 GB (REAP-150B: 85 GB) | **yes**, native DSML | **measure it.** One third the active parameters should mean materially less per-token traffic; the only figure in its doc is 1.5–1.6 tok/s on an unnamed host, so this is a hypothesis, not a recommendation |
-| **GLM-5.3-Flash** | 321B / 40B | ~195 GB converted | yes | a lighter GLM; same family, needs conversion |
-| Inkling | 975B / 41B | 469 GB | **no** — HTTP 400 on tools | unusable for a terminal client |
-| Kimi K3 | 2.8T / 104B | **~1.6 TB** | yes | **does not fit in RAM.** At 230 MB/s from NFS it would stream forever. Dead here |
-| Qwen3.8-Flash-Next | 125B / 6B | 185 GB | no | unusable for a terminal client |
-| Qwen3.6-35B-A3B | 35B / 3B | ~20 GB | — | same class the user just rejected; noted only because the CUDA VRAM tier measured **1.44 → 10.05 tok/s** on it |
-
-**Quality is not free and the number is known.** GLM-5.2's int4 container measures **−8.2 percentage
-points** against the unquantized model, concentrated on the hardest questions, and 62.5 % mean
-`acc_norm` on a 0-shot multiple-choice harness. Whether a 744B model at int4 beats a well-served
-smaller model at 8-bit **for our tasks** is a blind side-by-side nobody has run. It remains owed
-(`DESIGN.md` §13) and the pivot makes it more important, not less.
-
----
-
-## 10. Build and tune
-
-### 10.1 Build
-
-```
-module load CUDA/13.1.0        # matches driver CUDA UMD 13.3; the build notes say 13.x
-module load GCC/13.3.0         # or the system gcc 13.3.0 already on PATH
-make -C c glm CUDA=1 CUDA_ARCH=sm_86 CUDA_HOME=$EBROOTCUDA ARCH=native
-```
-
-- **`ARCH=native` is load-bearing, not a micro-optimisation.** The Makefile defaults to
-  `x86-64-v3`, which is AVX2. Our CPU has `avx512_vnni`, and colibrì selects a different int4
-  kernel family at compile time behind `#if defined(__AVX512VNNI__) && defined(__AVX512BW__)` — the
-  67.8 → 89.5 GB/s step in §3.4. Build without it and that measurement does not apply to us.
-- `CUDA_ARCH=sm_86` — A40 is compute capability 8.6.
-- No micromamba needed. colibrì's `BUILD-cuda-glibc241.md` recipe exists for hosts with no module
-  system; we have `CUDA/13.1.0`.
-- Build on a compute node, not the login node.
-
-### 10.2 The tuning protocol, which is mandatory and not optional
-
-**`.coli_usage` is a persistent learned routing profile that makes naive A/B benchmarking on this
-engine invalid.** colibrì's own report measured a byte-for-byte identical configuration at **5.46
-and then 2.56 tok/s** with no parameter changed, because the profile had re-tuned itself onto real
-usage between the two runs. A specialised profile is worth **≈ ×2**.
-
-Every measurement, without exception:
-
-```
-cp -f "$MODEL/.coli_usage" snapshot        # once, before the campaign
-# then before EVERY configuration:
-stop the backend; sleep 35                 # VRAM is not released immediately
-cp -f snapshot "$MODEL/.coli_usage"        # restore byte-for-byte
-start the backend; warm up on a fixed corpus; then measure
-```
-
-Two rules from the same report, each of which produced a published wrong claim: **never read
-cumulative log counters as current state** (count matching lines before and after the window and
-report the difference), and **never sample during a cold start** (loading takes minutes, during
-which GPU utilisation is legitimately 0 % and one layer may take 45 seconds — a sample there
-describes the loader, not the engine).
-
-### 10.3 The starting configuration
-
-Derived from §3, to be replaced by `coli tune`'s answer:
-
-| setting | value | why |
-|---|---|---|
-| `CUDA_DENSE` | `1` | ×2.8 on the reference host; the single most profitable flag, and undocumented |
-| `RAM_GB` | ~450 | the RAM budget is the lever that measurably paid (+25 %); we have 1 TB |
-| `PIN=stats PIN_GB=` | large | pin the hottest experts from the measured profile |
-| `XEXP` | `1` — **measure** | +11.6 % on 48 cores, neutral/negative on 24 |
-| `DIRECT`, `PIPE` | `1`, `1` | keep |
-| `URING`, `PILOT*` | **off** | +26 % once resident; they only burn the scarce CPU |
-| `CTX` | `131072` | four times the context for −23 % decode, prefill unchanged |
-| `COLI_PREFILL_CHUNK` | `2048` | at 512 the per-slice fixed costs dominate |
-| `KVSAVE` | `0` | PHI: no conversation state on shared storage |
-| `COLI_API_KEY` | set | closes `README.md` §7.20 |
-| `COLI_USAGE_DECAY` | on | without it a turn contributes 0.2 % against 18 M recorded selections and the profile stops tracking the workload |
-| `DRAFT` | measure | MTP speculation measured a **32 % loss** around 85 % expert hit; it must earn its keep |
-
-Run `coli plan --model <dir> --policy quality` first — it reports the planned tiers, the reason for
-each placement, the expected bottleneck, and a machine-readable `next_actions` list. Then `coli tune`
-for the OpenMP and NUMA sweep. Do not hand-tune past what those two produce without a controlled A/B.
-
----
-
-## 11. Verify before writing code (P0)
+## 9. The measurement campaign (P0) — this is the phase that decides the design
 
 | # | test | settles |
 |---|---|---|
-| 1 | Fill a `c3` node's CPUs, then submit a `c3_short` job needing them. Watch for state `S`. | §4 — whether `c3` preemption is real. **Touches a shared queue: confirm with the user first.** |
-| 2 | Build with `ARCH=native CUDA=1`; run colibrì's `AVX512 i4 selftest`. | §10.1 — that the VNNI kernel family compiles in |
-| 3 | Stage the 372 GB container; time the download and one cold load. | §1 — the 27-minute figure |
-| 4 | **Restart on the same node and time the second load.** | §4 — whether page cache kills most of the cold start |
-| 5 | `coli plan`, then `coli tune`, under the §10.2 protocol. | §3 — the real tok/s, and the NUMA and thread answers |
-| 6 | A/B `numactl --membind=0` (24c, local) against `COLI_NUMA=1` (48c, interleaved). | §3.6 — ours alone to answer |
-| 7 | A/B `XEXP=1`. | §3.4 — +11.6 % or negative |
-| 8 | Point Claude Code at `/v1/messages` with `COLI_API_KEY` set; run one tool call end to end. | §6 — the front door |
-| 9 | Job A submits B with `afterany`; cancel A; confirm B runs. `--signal=B:TERM@120` reaches a trap. | §5 — the chain |
-| 10 | Read `AllocTRES` on the real backend job. | §4 — what 500 GB actually costs in CPUs |
+| 1 | Build colibrì `ARCH=native CUDA=1 CUDA_ARCH=sm_86`, run the `AVX512 i4 selftest` | the VNNI kernel family is compiled in |
+| 2 | Stage GLM-5.2 (372 GB); time the download and one cold load | the 27-minute figure |
+| 3 | Restart on the **same node**; time the second load | whether 1 TB of page cache kills the cold start |
+| 4 | `coli plan`, then `coli tune`, under the snapshot protocol (§10) | the real tok/s, plus the OpenMP and NUMA answers |
+| 5 | A/B `CUDA_DENSE=1` on one A40 | §3.4 — how much of the 122 ms the GPU takes |
+| 6 | **A/B one A40 against four** | §2.2 — the question pass two closed prematurely |
+| 7 | A/B `XEXP=1`, `numactl --membind=0` vs `COLI_NUMA=1`, MTP `DRAFT` depth | §3 — the remaining tier-2 levers |
+| 8 | vLLM tier 1: TP=4 against 2× TP=2, same model, aggregate tokens | §4.2 — the PCIe all-reduce tax |
+| 9 | Tier 1 under 6 simulated concurrent users | the number this whole project is for |
+| 10 | `c3` preemption: fill a node, submit a `c3_short` job, watch for state `S` | §12 — **touches a shared queue, confirm first** |
+| 11 | Chain: job A submits B with `afterany`; cancel A; confirm B runs | the restart mechanism |
 
-Tests 3–7 are the campaign that decides whether this service is worth running. **Do them before any
-supervisor code.** The previous revision could build its control plane first because ollama was
-already proven; nothing here is.
-
----
-
-## 12. Build order
-
-| phase | what lands | exit criterion |
-|---|---|---|
-| **P0** | the ten tests above | a real tok/s number on our hardware, under the snapshot protocol |
-| **P1** | one hand-run colibrì backend, tuned | Claude Code completes a real coding task against it, with a tool call |
-| **P2** | the sbatch, the heartbeat, `fleet up` / `status` / `down` | one command brings it up and refuses to claim success before a token is generated |
-| **P3** | supervisor, chain, kill switch | survives two walltime rollovers; `fleet down` stops it and nothing restarts |
-| **P4** | idle release, caps, the yield ladder's one rung, hold-off | yields on a real `Resources` job and does not take the node back early |
-| **P5** | vLLM + the filesystem batch queue (§8) | a corpus pass completes with a worker killed mid-run and no item lost |
-
-**Stop after P1 and you already have the thing the user asked for**, run by hand. P2–P4 are what make
-it survive being left alone. P5 is a different project that happens to share a repository.
+**Tests 4–9 are the campaign that decides whether this service is worth running.** Do them before
+any supervisor code.
 
 ---
 
-## 13. Decisions that are yours
+## 10. colibrì build and the mandatory tuning protocol
 
-1. **Partition.** `c3_short` (9 h, safe, 5 % duty lost to reloads) or `c3_accel` (7 d, no preemption,
-   but holds the cluster's only four-GPU node for a service that does not need four GPUs)? Plan says
-   `c3_short`, and says it reluctantly. Test 4 may make this easy.
-2. **Is ~92 CPUs and 500 GB on one of six nodes, continuously, acceptable?** That is the real ask
-   (§4). If not, the service does not exist in this form.
-3. **GLM-5.2 only, or measure DeepSeek V4 Flash first?** 13B active against 40B is a large potential
-   speed difference and the evidence for it is one unattributed number (§9).
-4. **Claude Code or opencode as the client?** colibrì speaks the Anthropic API natively, so Claude
-   Code works with three environment variables. Plan says Claude Code, opencode retained as fallback.
-5. **Is 6–12 tok/s acceptable for the work you have in mind?** If the intended use is an agent loop
-   rather than a consultant, the honest answer is that this service will not do it, and no
-   configuration in this document changes that.
+```
+module load CUDA/13.1.0 GCC/13.3.0
+make -C c glm CUDA=1 CUDA_ARCH=sm_86 CUDA_HOME=$EBROOTCUDA ARCH=native
+```
+
+**`ARCH=native` is load-bearing.** The Makefile defaults to `x86-64-v3`, which is AVX2. Our CPU has
+`avx512_vnni`, and colibrì selects a different int4 kernel behind
+`#if defined(__AVX512VNNI__) && defined(__AVX512BW__)` — the 67.8 → 89.5 GB/s step. Build without it
+and none of §3's numbers apply.
+
+**`.coli_usage` invalidates naive A/B benchmarking.** It is a persistent learned routing profile
+that survives restarts. A byte-for-byte identical configuration measured **5.46 and then 2.56 tok/s**
+with nothing changed; a specialised profile is worth **≈ ×2**. Before *every* configuration:
+snapshot the file, stop the engine, sleep 35 s (VRAM is not released immediately), restore the file
+byte-for-byte, restart, warm up on a fixed corpus, then measure. Never read cumulative log counters
+as current state. Never sample during a cold start.
+
+Starting configuration, to be replaced by `coli tune`: `CUDA_DENSE=1`, `RAM_GB≈450`, `PIN=stats`
+with a large `PIN_GB`, `XEXP=1` (measure), `DIRECT=1 PIPE=1`, **`URING` and `PILOT*` off** (+26 %
+once resident — they only burn the scarce CPU), `CTX=131072`, `COLI_PREFILL_CHUNK=2048`,
+`KVSAVE=0`, `COLI_API_KEY` set, `COLI_USAGE_DECAY` on, `KV_SLOTS=1` with `DRAFT` measured.
 
 ---
 
-## 14. Carried forward unchanged
+## 11. Decisions that are yours
 
-From the previous revision, still true and still load-bearing:
+1. **Does tier 1 bind the cluster network?** It must, to serve more than one node. That is an
+   explicit weakening of the loopback control (§6). Tier 3 stays socket-free regardless.
+2. **Is compute306 entire, plus one c3 node, an acceptable standing claim?** That is the real
+   footprint. If not, tier 1 shrinks to a single-GPU model and the quality target moves with it.
+3. **Which tier-1 model?** §4.2 makes this task one of P1 rather than a guess in a document.
+4. **Claude Code everywhere, or opencode for tier 1?** colibrì speaks Anthropic natively; vLLM does
+   not. Either write a thin adapter or accept two clients.
+5. **If tier 1 measures well, is tier 2 still worth 372 GB and a node?** Ask it again after test 9.
+   A good 235B at int4 may make the 744B a luxury — and GLM-5.2's int4 container carries a measured
+   **−8.2 percentage point** quantization cost, so the quality gap is smaller than the parameter
+   counts suggest. **A blind side-by-side on real tasks from our own repos is owed** before tier 2
+   is built.
 
-- `c3` can `SIGSTOP` a server and the client sees silence, not an error (test 1).
-- Memory asks silently buy CPUs: `MaxMemPerCPU=12000`, and the minimum billable unit is two CPUs
-  because cores carry two threads (proven by job 2070710: asked `cpu=1`, got `cpu=2`).
-- Almost every pending job here is `BeginTime`, not `Resources`; the yield filter is the load-bearing
-  part.
-- Scrub `SLURM_*` before any nested `sbatch` — inherited variables **override the `#SBATCH`
-  directives in the file** (`README.md` §7.19).
-- Truncate a log before grepping it for readiness (`README.md` §7.17).
-- Never report success from a submission; success is a health check answering (`DESIGN.md` §7.4).
-- `config/fleet.json` needs a `!config/fleet.json` line in `.gitignore`, which ignores `*.json`.
-- Durable facts graduate into `README.md` when built **and verified**; the corresponding
-  `DESIGN.md` entry is deleted. Commits carry no assistant attribution. Never push unasked.
+---
+
+## 12. Carried forward unchanged
+
+- `c3` can `SIGSTOP` a server and the client sees silence, not an error: `c3_short` is
+  `PriorityTier=20`, `c3` is 10 with `PreemptMode=SUSPEND`, same six nodes. **Inferred from
+  configuration, not observed** — test 10.
+- Memory asks silently buy CPUs (`MaxMemPerCPU=12000`), and the minimum billable unit is two CPUs
+  because cores carry two threads (job 2070710: asked `cpu=1`, got `cpu=2`).
+- Scrub `SLURM_*` before any nested `sbatch` — inherited variables override the `#SBATCH` directives
+  (`README.md` §7.19). Truncate a log before grepping it for readiness (§7.17). Never report success
+  from a submission (`DESIGN.md` §7.4).
+- Ampere has **no FP8 tensor cores**. AWQ, GPTQ/Marlin int4, int8 and bf16 only.
+- `config/fleet.json` needs a `!config/fleet.json` line in `.gitignore`.
+- Durable facts graduate into `README.md` when built **and verified**; the `DESIGN.md` entry is then
+  deleted. Commits carry no assistant attribution. Never push unasked.

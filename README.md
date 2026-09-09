@@ -30,14 +30,19 @@ appears, it uses this too.
 > is built and verified. (Added 2026-08-22.)
 
 > **Where the next phase is scheduled.** [`FLEET-BUILD.md`](FLEET-BUILD.md) is the build runbook.
-> **Revised 2026-09-09 (second pass): the service is now built around colibrì, not ollama.** The
-> ollama models are judged inadequate in reasoning quality for the work this is for, so the plan
-> centres on GLM-5.2 (744B, int4, 372 GB) on one node — one GPU, ~500 GB of RAM, ~6–12 tok/s — with
-> vLLM keeping a narrowed batch-only role and no router between them. The runbook carries the
-> performance arithmetic, the placement argument, the mandatory tuning protocol, the ten preflight
-> tests, and the five decisions that are the user's. Still nothing built. An 18-slide plain-language
-> walkthrough is [`docs/fleet_walkthrough.pdf`](docs/fleet_walkthrough.pdf) (source
-> `docs/fleet_walkthrough.tex`, built with `pdflatex`).
+> **Revised 2026-09-09 (third pass): three tiers on different hardware.** Tier 1 is the daily
+> driver — vLLM on compute306's four A40s serving a ~200–250B MoE at int4 with continuous batching,
+> many users at a projected 20–40 tok/s each. Tier 2 is the consultant — colibrì running GLM-5.2
+> (744B, int4, 372 GB) on one `c3` node at a projected 8–12 tok/s, reached by an explicit tool call.
+> Tier 3 is batch corpus work on the filesystem queue, with no socket at all.
+>
+> The reason for three tiers rather than one is arithmetic, not taste: GLM-5.2 routes top-8 of 256
+> experts, so the expert **union** grows almost linearly with batch size and **neither continuous
+> batching nor speculative decoding amortises the dominant cost**. Multi-user speed has to come from
+> a different model, not a different setting. The runbook carries that derivation, two corrections
+> to the previous pass, the eleven-test measurement campaign, and the five decisions that are the
+> user's. Still nothing built. A 16-slide walkthrough is
+> [`docs/fleet_walkthrough.pdf`](docs/fleet_walkthrough.pdf) (source `docs/fleet_walkthrough.tex`).
 
 > **How the assistant is fenced in.** [`PERMISSIONS.md`](PERMISSIONS.md) is the architecture record
 > for Claude Code's permission configuration on this account: which commands skip the prompt, which
@@ -716,12 +721,12 @@ Do not re-learn these.
   measurements we owe ourselves, and the traps anticipated but not yet paid for — is
   [`DESIGN.md`](DESIGN.md). Read that before writing any of it — and then
   [`FLEET-BUILD.md`](FLEET-BUILD.md), which turns it into an ordered build with exit criteria and
-  **supersedes its engine choice**: the service is now colibrì-first, ollama is dropped from the
-  plan, and vLLM is narrowed to batch corpus work only. The two most consequential revisions there:
-  a node's **1 TB of RAM holds the whole 372 GB model**, which makes the four-GPU node worth under
-  2 % and removes the reason to hold compute306; and the **27-minute cold start**, not the GPU, is
-  what constrains the design. Three things from `DESIGN.md` that change how the items below should
-  be read:
+  **supersedes its engine choice**: ollama is dropped, colibrì becomes the escalation tier, and
+  vLLM becomes both the daily driver and the batch engine. Two findings there change how the rest
+  of this repo should be read — the **expert-union arithmetic** that caps every multi-token
+  optimisation on a 744B top-8-of-256 model, and the **27-minute cold start** that constrains
+  anything holding one. Three things from `DESIGN.md` that change how the items below should be
+  read:
   - **Replicas, not shards.** With NVLink inactive (§1), independent single-GPU replicas beat
     tensor parallelism for any model that fits on one card — more aggregate throughput, and a replica
     can be surrendered one at a time where a 4-GPU job cannot. This supersedes the tensor-parallel
